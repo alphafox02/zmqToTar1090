@@ -13,6 +13,14 @@ zmqToTar1090 proxies traffic from a Sniffle receiver (https://github.com/alphafo
 
 ### Setup tar1090 for drone ingestion
 
+#### readsb modification
+
+I haven't tested running this at the same time as ADSB input, so for now you'll need to add the following line to the top of the readsb script that's within the tar1090 project (https://github.com/sdr-enthusiasts/docker-tar1090/blob/main/rootfs/etc/s6-overlay/scripts/readsb)
+
+```exec sleep infinity```
+
+This makes it so even if readsb isn't running, the drone decoding will still work.
+
 #### Dockerfile
 
 - Append `TAR1090_CONFIGJS_APPEND='droneJson="./data/drone.json"'` to the ENV section of the docker-tar1090 Dockerfile
