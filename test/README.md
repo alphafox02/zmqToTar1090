@@ -23,3 +23,11 @@ You can on-the-fly modify the `drone_lib.py` file to:
 - change name of drone
 
 This only supports 3 drones, so you can't add additional values in the "id_num" nor the coordinate python lists. This is only a POC to show that tar1090 is updating accordingly.
+
+## How It Works
+
+The `droneToZMQ.py` acts like the sniffle_receiver.py script from the Sniffle project.
+
+It creates a ZMQ server, and will send JSON data read from `drone_send.json` out over ZMQ. This data is formatted in (hopefully) the same way that the Sniffle receiver would be reading it as if there was a drone flying around and you were sniffing it's location data.
+
+The zmqToTar1090.py will then read that data and send it to `/run/readsb/drone.json` for ingestion into tar1090.
