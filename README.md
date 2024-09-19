@@ -47,6 +47,12 @@ This will create a `drone.json` file in the /run/readsb directory for ingestion 
 
 You can use ```python3 zmqToTar10909.py --help``` to show runtime arguments
 
+## Testing
+
+I created a separate script you can run if you don't yet have a Sniffle compatible dongle. You'll still need tar1090 and the zmqToTar1090 script.
+
+For more information, see the README in that folder
+
 ## How It Works
 
 ## Troubleshooting
