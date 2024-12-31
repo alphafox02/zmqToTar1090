@@ -47,19 +47,8 @@ class Drone:
         """Convert the Drone instance to a dictionary."""
         return {
             'id': self.id,
-            #
-            # Something weird is going on with the timestamps...
-            # When the UTC timestamp is used, during the comparison for old drones in the 'update_or_add_drone' function, it adds an extra X hours to the unix epoch
-            # I also included the original valued before my changes to the stale field just in case"""
-            #
-            #'time': datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
-            #'start': datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
-            #'stale': (datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
-            #'stale': (datetime.datetime.strptime(self.start,'%Y-%m-%dT%H:%M:%S.%fZ') + datetime.timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
-            #
-            'time': datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+            #'start': datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
             'start': self.start,
-            'stale': (datetime.datetime.now() + datetime.timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
             'lat': self.lat,
             'lon': self.lon,
             'speed': self.speed,
@@ -88,14 +77,14 @@ def parse_float(value: str) -> float:
 
 class DroneManager:
     """Manages a collection of drones and handles their updates."""    
-    def __init__(self, max_drones=30, rate_limit=1.0):
+    def __init__(self, max_drones=30):
         self.drones = deque(maxlen=max_drones)
         self.drone_dict = {}
-        self.rate_limit = rate_limit
-        self.last_sent_time = time.time()
+        #self.last_sent_time = time.time()
 
     def update_or_add_drone(self, drone_id, drone_data):
         """Updates an existing drone or adds a new one to the collection."""
+
         if drone_id not in self.drone_dict:
             if len(self.drones) >= self.drones.maxlen:
                 oldest_drone = self.drones.popleft()
@@ -115,42 +104,45 @@ class DroneManager:
                 description=drone_data.description,
                 start=drone_data.start
             )
-        
-    def send_updates(self, file):
-        """Sends updates to json file for reading from tarDRONE"""
-        ## new updates
+
+    def remove_old_drones(self):
+        current_time = round(time.time(), 2)
+        drones_to_remove = []
+        for drone in self.drones:
+            drone_time = self.drone_dict[drone].start
+            if (current_time - drone_time > 10):
+                logger.debug(f"Removing drone: {drone}")
+                drones_to_remove.append(drone)
+
+        for drone in drones_to_remove:
+            del self.drone_dict[drone]
+            self.drones.remove(drone)
+            
+    def print_updates(self):
         data_to_write = []
         for drone_id in self.drones:
-            # Current drone start time in Unix epoch
-            x = int(datetime.datetime.strptime(self.drone_dict[drone_id].start,'%Y-%m-%dT%H:%M:%S.%fZ').timestamp())
-
-            # Current time in Unix epoch
-            y = int(datetime.datetime.now(datetime.UTC).timestamp())
-
-            # Helpful in debugging timestamps and rate limit
-            #print(f"Drone ID {self.drone_dict[drone_id].id} start epoch Time:\t {x}")
-            #print(f"Drone ID {self.drone_dict[drone_id].id} current epoch Time:\t {y}")
-            #print(f"Last Sent Time: {int(time.time() - self.last_sent_time)}")
-            #print(f"Rate Limit Set: {self.rate_limit}")
-
-            # Does rate limit need to apply here? ... not working yet
-            #if ((y - x) < 5) and (time.time() - self.last_sent_time >= self.rate_limit):
-
-            if ((y - x) < 5):
-                data_to_write.append(self.drone_dict[drone_id].to_dict())
+            data_to_write.append(self.drone_dict[drone_id].to_dict())
+        pretty = json.dumps(data_to_write, indent=4)
+        return pretty
+ 
+    def send_updates(self, file):
+        """Sends updates to json file for reading from tarDRONE"""
+        data_to_write = []
+        for drone_id in self.drones:
+            data_to_write.append(self.drone_dict[drone_id].to_dict())
             try:
                 JSONWriter(file, data_to_write)
-                self.last_sent_time = time.time()
+                #self.last_sent_time = time.time()
             except Exception as e:
                 print(f"An error occurred while writing to the file: {e}")
 
-def zmq_to_json(zmq_host, zmq_port, file, rate_limit: float = 1.0, max_drones: int = 30):
+def zmq_to_json(zmqsetting, file, max_drones: int = 30):
     context = zmq.Context()
     zmq_socket = context.socket(zmq.SUB)
-    zmq_socket.connect(f"tcp://{zmq_host}:{zmq_port}")
+    zmq_socket.connect(f"tcp://{zmqsetting}")
     zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
-    drone_manager = DroneManager(max_drones=max_drones, rate_limit=rate_limit)
+    drone_manager = DroneManager(max_drones=max_drones)
     
     def signal_handler(sig, frame):
         print("Interrupted by user")
@@ -165,7 +157,7 @@ def zmq_to_json(zmq_host, zmq_port, file, rate_limit: float = 1.0, max_drones: i
         while True:
             try:
                 message = zmq_socket.recv_json()
-
+                
                 drone_info = {}
                 for item in message:
                     if 'Basic ID' in item:
@@ -180,12 +172,10 @@ def zmq_to_json(zmq_host, zmq_port, file, rate_limit: float = 1.0, max_drones: i
                     if 'id' in drone_info:
                         if not drone_info['id'].startswith('drone-'):
                             drone_info['id'] = f"drone-{drone_info['id']}"
-                            drone_info['start'] = datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-                            # This old value applies to the 'to_dict' function above for drone start times.
-                            #drone_info['start'] = datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-                        logger.debug(f"Ensured drone id with prefix: {drone_info['id']}")
+                            #drone_info['start'] = datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+                            drone_info['start'] = round(time.time(), 2)
+                            logger.debug(f"Ensured drone id with prefix: {drone_info['id']}")
 
-                    # This would be used depending on what the incoming message is over Sniffle that provides the location information
                     if 'Location/Vector Message' in item:
                         drone_info['lat'] = parse_float(item['Location/Vector Message'].get('latitude', "0.0"))
                         drone_info['lon'] = parse_float(item['Location/Vector Message'].get('longitude', "0.0"))
@@ -193,13 +183,6 @@ def zmq_to_json(zmq_host, zmq_port, file, rate_limit: float = 1.0, max_drones: i
                         drone_info['vspeed'] = parse_float(item['Location/Vector Message'].get('vert_speed', "0.0"))
                         drone_info['alt'] = parse_float(item['Location/Vector Message'].get('geodetic_altitude', "0.0"))
                         drone_info['height'] = parse_float(item['Location/Vector Message'].get('height_agl', "0.0"))
-                    if 'Location Vector' in item:
-                        drone_info['lat'] = parse_float(item['Location Vector']['coord'].get('latitude', "0.0"))
-                        drone_info['lon'] = parse_float(item['Location Vector']['coord'].get('longitude', "0.0"))
-                        drone_info['speed'] = parse_float(item['Location Vector']['coord'].get('speed', "0.0"))
-                        drone_info['vspeed'] = parse_float(item['Location Vector']['coord'].get('vert_speed', "0.0"))
-                        drone_info['alt'] = parse_float(item['Location Vector']['coord'].get('geodetic_altitude', "0.0"))
-                        drone_info['height'] = parse_float(item['Location Vector']['coord'].get('height_agl', "0.0"))
 
                     if 'Self-ID Message' in item:
                         drone_info['description'] = item['Self-ID Message'].get('text', "")
@@ -229,21 +212,21 @@ def zmq_to_json(zmq_host, zmq_port, file, rate_limit: float = 1.0, max_drones: i
             except Exception as e:
                 logger.error(f"Error receiving or processing message: {e}")
 
+            drone_manager.remove_old_drones()
+
     except KeyboardInterrupt:
         signal_handler(None, None)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ZMQ to TCP proxy for converting drone data to ANTSDR format.")
-    parser = argparse.ArgumentParser(description="ZMQ to JSON for converting drone data to use with tarDRONE.")
-    parser.add_argument("--zmq-host", default="127.0.0.1", help="ZMQ server host")
-    parser.add_argument("--zmq-port", type=int, default=2402, help="ZMQ server port")
-    parser.add_argument("--json-file", default="/run/readsb/drone.json", help="JSON file to write parsed data to.")
+    parser = argparse.ArgumentParser(description="ZMQ to TCP proxy for converting drone data to ANTSDR format")
+    parser = argparse.ArgumentParser(description="ZMQ to JSON for converting drone data to use with tarDRONE")
+    parser.add_argument("--zmqsetting", default="127.0.0.1:4224", help="Define ZMQ server to connect to")
+    parser.add_argument("--json-file", default="/run/readsb/drone.json", help="JSON file to write parsed data to")
     parser.add_argument("--max-drones", default=30, help="Number of drones to filter for")
-    parser.add_argument("--rate-limit", default=1.0, help="Rate limit for sending updates to json file")
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
     logging.info("Starting ZMQ to json with log level: %s","DEBUG" if args.debug else "INFO")
 
-    zmq_to_json(args.zmq_host, args.zmq_port, '/run/readsb/drone.json')
+    zmq_to_json(args.zmqsetting, args.json_file)
