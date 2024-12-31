@@ -27,8 +27,8 @@ def parse_float(value: str) -> float:
         return 0.0
 
 class Drone:
-    """Represents a drone and its telemetry data."""
-    def __init__(self, 
+    """Represents a drone (or pilot) for tar1090 data."""
+    def __init__(self,
                  id: str,
                  lat: float,
                  lon: float,
@@ -50,8 +50,8 @@ class Drone:
         self.pilot_lat = pilot_lat
         self.pilot_lon = pilot_lon
         self.description = description
-        # For tar1090: an ISO8601 date/time string
-        self.time = time_str  # "2024-01-02T03:04:05.678Z"
+        # For tar1090: store an ISO8601 date/time string
+        self.time = time_str
 
     def update(self,
                lat: float,
@@ -77,29 +77,32 @@ class Drone:
         self.time = time_str
 
     def to_dict(self) -> dict:
-        """Convert the Drone instance to a dict that tar1090 can use."""
+        """
+        Convert the Drone instance to a dictionary.
+        Tar1090 can read 'time' as an ISO8601 string to compute 'seen'.
+        """
         return {
-            "id": self.id,       # you can keep "id" or rename to "hex"
-            "time": self.time,   # iso8601, tar1090 can parse this
+            "id": self.id,         # or "hex" if you prefer
+            "time": self.time,     # ISO8601
             "lat": self.lat,
             "lon": self.lon,
             "speed": self.speed,
             "vspeed": self.vspeed,
             "alt": self.alt,
             "height": self.height,
-            "pilot_lat": self.pilot_lat,
+            "pilot_lat": self.pilot_lat,  # not used for pilot object itself
             "pilot_lon": self.pilot_lon,
             "description": self.description
         }
 
 class DroneManager:
-    """Manages a collection of drones and handles their updates."""
+    """Manages drones (and now also pilot entries) for tar1090."""
     def __init__(self, max_drones=30):
-        self.drones = deque(maxlen=max_drones)  # track drone IDs in FIFO
+        self.drones = deque(maxlen=max_drones)  # track IDs in FIFO
         self.drone_dict = {}
 
     def update_or_add_drone(self, drone_id: str, new_data: Drone):
-        """Updates or adds a new drone to the manager."""
+        """Updates or adds a new drone/pilot entry."""
         if drone_id not in self.drone_dict:
             # If at capacity, remove oldest
             if len(self.drones) >= self.drones.maxlen:
@@ -124,8 +127,8 @@ class DroneManager:
 
     def remove_old_drones(self, max_age=10):
         """
-        Removes drones that haven't been updated in > max_age seconds.
-        We'll parse the 'time' field (ISO8601) to compare against now.
+        Removes drones/pilots that haven't been updated in > max_age seconds,
+        based on the 'time' field (ISO8601).
         """
         now_ts = time.time()
         remove_list = []
@@ -136,25 +139,21 @@ class DroneManager:
                 dt = datetime.datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
                 last_seen_ts = dt.timestamp()
             except ValueError:
-                # If something's wrong with the date format, remove it
                 last_seen_ts = 0.0
 
             if (now_ts - last_seen_ts) > max_age:
                 remove_list.append(drone_id)
 
         for d_id in remove_list:
-            logger.debug(f"Removing old drone {d_id}")
+            logger.debug(f"Removing old entry {d_id}")
             self.drones.remove(d_id)
             del self.drone_dict[d_id]
 
     def send_updates(self, json_file):
-        """
-        Writes the data in array-of-objects format. Each object has a 'time' field
-        so tar1090 can parse how recent it is.
-        """
+        """Writes out the entire current drone/pilot list to JSON."""
         data_to_write = []
-        for drone_id in self.drones:
-            data_to_write.append(self.drone_dict[drone_id].to_dict())
+        for d_id in self.drones:
+            data_to_write.append(self.drone_dict[d_id].to_dict())
 
         try:
             with open(json_file, 'w', encoding='utf-8') as fp:
@@ -162,59 +161,11 @@ class DroneManager:
         except Exception as e:
             logger.error(f"Error writing JSON: {e}")
 
-def parse_esp32_dict(message: dict) -> dict:
-    """
-    Example parser for an ESP32 style message. 
-    Suppose it has top-level fields like 'drone_id', 'latitude', 'longitude', etc.
-    Adjust as needed.
-    """
-    drone_info = {}
-
-    # Basic ID might still exist, or it might not
-    if 'Basic ID' in message:
-        id_type = message['Basic ID'].get('id_type')
-        if id_type == 'Serial Number (ANSI/CTA-2063-A)' and 'id' not in drone_info:
-            drone_info['id'] = message['Basic ID'].get('id', 'unknown')
-        elif id_type == 'CAA Assigned Registration ID' and 'id' not in drone_info:
-            drone_info['id'] = message['Basic ID'].get('id', 'unknown')
-
-    # If the ESP32 has a custom 'drone_id' key
-    if 'drone_id' in message and 'id' not in drone_info:
-        drone_info['id'] = message['drone_id']
-
-    # Grab lat/lon, or fall back to "Location/Vector Message" if that also exists
-    if 'latitude' in message:
-        drone_info['lat'] = parse_float(str(message['latitude']))
-    if 'longitude' in message:
-        drone_info['lon'] = parse_float(str(message['longitude']))
-    if 'altitude' in message:
-        drone_info['alt'] = parse_float(str(message['altitude']))
-    if 'speed' in message:
-        drone_info['speed'] = parse_float(str(message['speed']))
-    if 'vert_speed' in message:
-        drone_info['vspeed'] = parse_float(str(message['vert_speed']))
-    if 'height' in message:
-        drone_info['height'] = parse_float(str(message['height']))
-
-    # Possibly pilot lat/lon
-    if 'pilot_lat' in message:
-        drone_info['pilot_lat'] = parse_float(str(message['pilot_lat']))
-    if 'pilot_lon' in message:
-        drone_info['pilot_lon'] = parse_float(str(message['pilot_lon']))
-
-    # Maybe a top-level 'description'
-    if 'description' in message:
-        drone_info['description'] = message['description']
-    else:
-        drone_info['description'] = message.get('Self-ID Message', {}).get('text', "")
-
-    return drone_info
-
+#
+# Example parse functions for old-list style or new-dict style
+#
 def parse_list_format(message_list: list) -> dict:
-    """
-    The old format: an array of dicts containing 
-    'Basic ID', 'Location/Vector Message', 'Self-ID Message', etc.
-    """
+    """The old format: array of dicts with 'Basic ID', 'Location/Vector Message', etc."""
     drone_info = {}
     for item in message_list:
         if not isinstance(item, dict):
@@ -249,11 +200,66 @@ def parse_list_format(message_list: list) -> dict:
 
     return drone_info
 
+def parse_esp32_dict(message: dict) -> dict:
+    """
+    New format from an ESP32 as a single dict with top-level fields, e.g.:
+      {
+        "drone_id": "ABCD1234",
+        "latitude": 37.12345,
+        "longitude": -122.54321,
+        "altitude": 100.0,
+        "speed": 5.0,
+        "vert_speed": 0.0,
+        "pilot_lat": 37.124,
+        "pilot_lon": -122.544,
+        ...
+      }
+    """
+    drone_info = {}
+
+    # Basic ID may or may not be present
+    if 'Basic ID' in message:
+        id_type = message['Basic ID'].get('id_type')
+        if id_type == 'Serial Number (ANSI/CTA-2063-A)' and 'id' not in drone_info:
+            drone_info['id'] = message['Basic ID'].get('id', 'unknown')
+        elif id_type == 'CAA Assigned Registration ID' and 'id' not in drone_info:
+            drone_info['id'] = message['Basic ID'].get('id', 'unknown')
+
+    # If the ESP32 sends "drone_id"
+    if 'drone_id' in message and 'id' not in drone_info:
+        drone_info['id'] = message['drone_id']
+
+    if 'latitude' in message:
+        drone_info['lat'] = parse_float(str(message['latitude']))
+    if 'longitude' in message:
+        drone_info['lon'] = parse_float(str(message['longitude']))
+    if 'altitude' in message:
+        drone_info['alt'] = parse_float(str(message['altitude']))
+    if 'speed' in message:
+        drone_info['speed'] = parse_float(str(message['speed']))
+    if 'vert_speed' in message:
+        drone_info['vspeed'] = parse_float(str(message['vert_speed']))
+    if 'height' in message:
+        drone_info['height'] = parse_float(str(message['height']))
+
+    if 'pilot_lat' in message:
+        drone_info['pilot_lat'] = parse_float(str(message['pilot_lat']))
+    if 'pilot_lon' in message:
+        drone_info['pilot_lon'] = parse_float(str(message['pilot_lon']))
+
+    # If there's a top-level "description"
+    if 'description' in message:
+        drone_info['description'] = message['description']
+    else:
+        # fallback if "Self-ID Message" is used
+        drone_info['description'] = message.get('Self-ID Message', {}).get('text', "")
+
+    return drone_info
+
 def zmq_to_json(zmqsetting, file, max_drones=30):
     """
-    Script that connects to ZMQ, receives messages, 
-    handles either old list-based or new ESP32 dict-based format,
-    and writes data for tar1090.
+    Main tar1090-ish script. If pilot lat/lon is present, 
+    we add a second entry with 'pilot-xxxx' ID.
     """
     context = zmq.Context()
     zmq_socket = context.socket(zmq.SUB)
@@ -274,6 +280,7 @@ def zmq_to_json(zmqsetting, file, max_drones=30):
     while True:
         try:
             message = zmq_socket.recv_json()
+
             # Decide which parser to use
             if isinstance(message, list):
                 drone_info = parse_list_format(message)
@@ -287,12 +294,16 @@ def zmq_to_json(zmqsetting, file, max_drones=30):
             if 'id' in drone_info:
                 if not drone_info['id'].startswith('drone-'):
                     drone_info['id'] = f"drone-{drone_info['id']}"
+                
+                # Grab the pilot coords
+                pilot_lat = drone_info.get('pilot_lat', 0.0)
+                pilot_lon = drone_info.get('pilot_lon', 0.0)
 
-                # Always add a 'time' field in ISO8601 for tar1090
-                drone_time = iso_timestamp_now()
+                # Always add a 'time' field in ISO8601 format
+                iso_time = iso_timestamp_now()
 
-                # Create or update a Drone object
-                drone = Drone(
+                # 1) Create/Update the main drone
+                main_drone = Drone(
                     id=drone_info['id'],
                     lat=drone_info.get('lat', 0.0),
                     lon=drone_info.get('lon', 0.0),
@@ -300,34 +311,61 @@ def zmq_to_json(zmqsetting, file, max_drones=30):
                     vspeed=drone_info.get('vspeed', 0.0),
                     alt=drone_info.get('alt', 0.0),
                     height=drone_info.get('height', 0.0),
-                    pilot_lat=drone_info.get('pilot_lat', 0.0),
-                    pilot_lon=drone_info.get('pilot_lon', 0.0),
+                    pilot_lat=pilot_lat,
+                    pilot_lon=pilot_lon,
                     description=drone_info.get('description', ""),
-                    time_str=drone_time
+                    time_str=iso_time
                 )
+                drone_manager.update_or_add_drone(main_drone.id, main_drone)
 
-                drone_manager.update_or_add_drone(drone_info['id'], drone)
+                # 2) If pilot lat/lon is valid, create second "pilot" object
+                #    with same "description" & time, but separate ID
+                if (pilot_lat != 0.0 or pilot_lon != 0.0):
+                    pilot_id = main_drone.id.replace("drone-", "pilot-")
+                    pilot_drone = Drone(
+                        id=pilot_id,
+                        lat=pilot_lat,
+                        lon=pilot_lon,
+                        speed=0.0,
+                        vspeed=0.0,
+                        alt=0.0,      # pilot presumably at ground level
+                        height=0.0,
+                        pilot_lat=0.0,
+                        pilot_lon=0.0,
+                        # same description as main drone, per your request
+                        description=main_drone.description,
+                        time_str=iso_time
+                    )
+                    drone_manager.update_or_add_drone(pilot_id, pilot_drone)
+                else:
+                    # If no pilot data, optionally remove a leftover "pilot-xxx" from old updates
+                    pilot_id = drone_info['id'].replace("drone-", "pilot-")
+                    if pilot_id in drone_manager.drone_dict:
+                        logger.debug(f"Removing stale pilot entry {pilot_id}")
+                        drone_manager.drones.remove(pilot_id)
+                        del drone_manager.drone_dict[pilot_id]
+
             else:
-                logger.warning("No 'id' found in message. Skipping...")
+                logger.warning("No 'id' found in the message. Skipping...")
 
             # After updating, write JSON
             drone_manager.send_updates(file)
 
-            # Remove any drones that haven't been updated for > 10s
+            # Remove any drones/pilots that haven't been updated in >10s
             drone_manager.remove_old_drones(max_age=10)
 
         except Exception as e:
             logger.error(f"Error receiving or processing message: {e}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ZMQ to JSON for tar1090, handling old & ESP32 formats.")
+    parser = argparse.ArgumentParser(description="ZMQ to JSON for tar1090, with pilot-loc logic.")
     parser.add_argument("--zmqsetting", default="127.0.0.1:4224", help="ZMQ server to connect to (host:port)")
-    parser.add_argument("--json-file", default="/run/readsb/drone.json", help="JSON file to write tar1090 data to")
-    parser.add_argument("--max-drones", type=int, default=30, help="Maximum number of drones to track")
+    parser.add_argument("--json-file", default="/run/readsb/drone.json", help="Where to write the JSON")
+    parser.add_argument("--max-drones", type=int, default=30, help="Max number of drones/pilots to track")
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
-    logging.info("Starting ZMQ to JSON with log level: %s", "DEBUG" if args.debug else "INFO")
+    logging.info("Starting ZMQ to JSON with pilot logic. Log level: %s", "DEBUG" if args.debug else "INFO")
 
     zmq_to_json(args.zmqsetting, args.json_file, max_drones=args.max_drones)
