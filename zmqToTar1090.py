@@ -13,6 +13,7 @@ import time
 import logging
 from collections import deque
 import re
+import shutil
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -28,11 +29,23 @@ def parse_float(value: str) -> float:
     except (ValueError, AttributeError):
         return 0.0
 
-def JSONWriter(file, data: list):
-    """Writes drone data to a JSON file."""
+def JSONWriter(file, data: list, create_backup: bool = False):
+    """Writes drone data to a JSON file with optional backup."""
     try:
+        if create_backup:
+            # Create a backup with timestamp
+            backup_file = f"{file}.{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}.bak"
+            shutil.copyfile(file, backup_file)
+            logger.debug(f"Created backup of JSON file at '{backup_file}'.")
+        # Write the new data
         with open(file, 'w', encoding='utf-8') as json_file:
             json.dump(data, json_file, indent=4)
+        logger.debug(f"Wrote new data to JSON file '{file}'.")
+    except FileNotFoundError:
+        # If the original file doesn't exist, create it without backup
+        with open(file, 'w', encoding='utf-8') as json_file:
+            json.dump(data, json_file, indent=4)
+        logger.debug(f"Created new JSON file '{file}'.")
     except (IOError, TypeError) as e:
         logger.error(f"An error occurred while writing to the file: {e}")
 
@@ -54,7 +67,7 @@ def is_valid_mac(mac: str) -> bool:
 class Drone:
     """Represents a drone and its telemetry data."""
     def __init__(self, id: str, mac: str = ""):
-        self.id = id  # Serial Number or Pilot ID
+        self.id = id  # Serial Number or FAA ID
         self.mac = mac.lower() if mac else ""  # Ensure MAC is lowercase if provided
         # Telemetry Data
         self.lat = 0.0
@@ -65,12 +78,12 @@ class Drone:
         self.height = 0.0
         self.pilot_lat = 0.0
         self.pilot_lon = 0.0
-        self.description = ""
+        self.description_parts = set()  # Use a set to store unique description parts
         self.time = iso_timestamp_now()  # Last updated time
 
     def update(self, data: dict):
         """Updates the drone's telemetry data and last seen time."""
-        # Update fields if present in the incoming data
+        # Update telemetry fields if present
         self.lat = data.get('lat', self.lat)
         self.lon = data.get('lon', self.lon)
         self.speed = data.get('speed', self.speed)
@@ -79,7 +92,16 @@ class Drone:
         self.height = data.get('height', self.height)
         self.pilot_lat = data.get('pilot_lat', self.pilot_lat)
         self.pilot_lon = data.get('pilot_lon', self.pilot_lon)
-        self.description = data.get('description', self.description)
+
+        # Update descriptions
+        new_description = data.get('description', "")
+        if new_description:
+            # Split the description into parts using ';' as a delimiter
+            parts = [part.strip() for part in new_description.split(';') if part.strip()]
+            self.description_parts.update(parts)
+            logger.debug(f"Updated description parts for drone '{self.id}': {self.description_parts}")
+
+        # Update the timestamp
         self.time = data.get('time', iso_timestamp_now())
 
     def to_dict(self) -> dict:
@@ -93,7 +115,7 @@ class Drone:
             "vspeed": self.vspeed,
             "alt": self.alt,
             "height": self.height,
-            "description": self.description
+            "description": "; ".join(sorted(self.description_parts))
         }
         # Include pilot information only if both pilot_lat and pilot_lon are non-zero
         if self.pilot_lat != 0.0 and self.pilot_lon != 0.0:
@@ -111,26 +133,47 @@ class DroneManager:
     def update_or_add_main_drone(self, drone_info: dict) -> str:
         """
         Updates an existing main drone or adds a new one based on MAC address.
-        `drone_info` must include 'id' and 'mac'.
+        Handles only 'Serial Number' and 'CAA Assigned Registration ID' id_types.
         Returns the main drone ID if successful, else None.
         """
         mac = drone_info.get('mac')
-        drone_id = drone_info.get('id')
+        serial_number = drone_info.get('id', None)  # 'id' is 'serial_number' if available
+        description = drone_info.get('description', "")
 
         if not mac:
-            logger.debug(f"Drone '{drone_id}' has no MAC address. Skipping...")
+            logger.debug(f"Drone with ID '{serial_number}' has no MAC address. Skipping...")
             return None
 
+        if serial_number:
+            drone_id_full = f"drone-{serial_number}"
+        else:
+            drone_id_full = "drone-unknown"
+
         if mac in self.mac_to_drone_id:
-            # Existing drone, update based on MAC
             existing_id = self.mac_to_drone_id[mac]
-            drone = self.drone_dict[existing_id]
-            if drone_id != drone.id:
-                logger.debug(f"Conflicting IDs for MAC '{mac}': '{drone.id}' vs '{drone_id}'. Using original ID.")
-                # Decide whether to overwrite ID or retain original. Currently retaining original.
-            drone.update(drone_info)
-            logger.debug(f"Updated drone '{drone.id}' with MAC '{mac}'.")
-            return existing_id
+            existing_drone = self.drone_dict[existing_id]
+
+            # Update 'id' if a Serial Number is provided and it's different
+            if serial_number and existing_drone.id != drone_id_full:
+                # Update 'id'
+                existing_drone.id = drone_id_full
+                self.drone_dict[drone_id_full] = existing_drone
+                del self.drone_dict[existing_id]
+                self.mac_to_drone_id[mac] = drone_id_full
+                logger.debug(f"Updated drone ID from '{existing_id}' to '{drone_id_full}' based on Serial Number.")
+
+            # Append CAA Assigned Registration ID to description if present
+            if description:
+                # Assuming description contains only CAA Assigned Registration ID
+                # Avoid adding Serial Number or other texts
+                existing_drone.update({'description': description})
+                logger.debug(f"Appended description to drone '{existing_drone.id}': {description}")
+
+            # Update telemetry
+            existing_drone.update(drone_info)
+            logger.debug(f"Updated drone '{existing_drone.id}' with MAC '{mac}'.")
+
+            return self.mac_to_drone_id[mac]
         else:
             # New drone, add to manager
             if len(self.drones) >= self.drones.maxlen:
@@ -138,13 +181,15 @@ class DroneManager:
                 del self.mac_to_drone_id[oldest_mac]
                 del self.drone_dict[oldest_id]
                 logger.debug(f"Removed oldest drone '{oldest_id}' with MAC '{oldest_mac}'.")
-            self.drones.append((mac, drone_id))
-            new_drone = Drone(id=drone_id, mac=mac)
+
+            new_drone = Drone(id=drone_id_full, mac=mac)
             new_drone.update(drone_info)
-            self.drone_dict[drone_id] = new_drone
-            self.mac_to_drone_id[mac] = drone_id
-            logger.debug(f"Added new drone '{drone_id}' with MAC '{mac}'.")
-            return drone_id
+            self.drones.append((mac, drone_id_full))
+            self.drone_dict[drone_id_full] = new_drone
+            self.mac_to_drone_id[mac] = drone_id_full
+            logger.debug(f"Added new drone '{drone_id_full}' with MAC '{mac}'.")
+
+            return drone_id_full
 
     def update_or_add_pilot_drone(self, main_drone_id: str, drone_info: dict):
         """
@@ -168,7 +213,10 @@ class DroneManager:
                 new_pilot.height = 0.0
                 new_pilot.pilot_lat = 0.0
                 new_pilot.pilot_lon = 0.0
-                new_pilot.description = self.drone_dict[main_drone_id].description
+                # Inherit descriptions from main drone
+                if main_drone_id in self.drone_dict:
+                    main_drone = self.drone_dict[main_drone_id]
+                    new_pilot.description_parts = set(main_drone.description_parts)
                 new_pilot.time = drone_info.get('time', iso_timestamp_now())
                 self.drones.append((None, pilot_id))  # Pilots don't have a MAC
                 self.drone_dict[pilot_id] = new_pilot
@@ -178,7 +226,7 @@ class DroneManager:
                 pilot_drone = self.drone_dict[pilot_id]
                 pilot_drone.lat = pilot_lat
                 pilot_drone.lon = pilot_lon
-                pilot_drone.time = drone_info.get('time', iso_timestamp_now())
+                pilot_drone.update(drone_info)
                 logger.debug(f"Updated pilot drone '{pilot_id}'.")
         else:
             # Pilot coordinates are invalid; remove pilot drone if exists
@@ -233,70 +281,22 @@ class DroneManager:
         """Converts all drones to a list of dictionaries for JSON serialization."""
         return [drone.to_dict() for drone in self.drone_dict.values()]
 
-    def send_updates(self, file: str):
-        """Writes the current drone data to the specified JSON file."""
+    def send_updates(self, file: str, create_backup: bool = False):
+        """Writes the current drone data to the specified JSON file with optional backup."""
         data_to_write = self.to_json_list()
         try:
-            JSONWriter(file, data_to_write)
+            JSONWriter(file, data_to_write, create_backup)
             logger.debug(f"Updated JSON file '{file}' with {len(data_to_write)} drones.")
         except Exception as e:
             logger.error(f"Error writing JSON: {e}")
-
-def parse_esp32_dict(message: dict) -> dict:
-    """Parses ESP32 formatted drone data (single dict) and extracts relevant information including MAC address."""
-    drone_info = {}
-
-    # Check for 'Basic ID'
-    if 'Basic ID' in message:
-        id_type = message['Basic ID'].get('id_type')
-        if id_type == 'Serial Number (ANSI/CTA-2063-A)' and 'id' not in drone_info:
-            drone_info['id'] = message['Basic ID'].get('id', 'unknown')
-        elif id_type == 'CAA Assigned Registration ID' and 'id' not in drone_info:
-            drone_info['id'] = message['Basic ID'].get('id', 'unknown')
-
-        # Extract MAC address
-        mac = message['Basic ID'].get('MAC')
-        if mac and is_valid_mac(mac):
-            drone_info['mac'] = mac.lower()  # Standardize to lowercase
-        else:
-            logger.debug(f"Invalid or missing MAC address in ESP32 message: '{mac}'.")
-
-    # Custom 'drone_id' key (if exists)
-    if 'drone_id' in message and 'id' not in drone_info:
-        drone_info['id'] = message['drone_id']
-
-    # Parse location data
-    if 'latitude' in message:
-        drone_info['lat'] = parse_float(str(message['latitude']))
-    if 'longitude' in message:
-        drone_info['lon'] = parse_float(str(message['longitude']))
-    if 'altitude' in message:
-        drone_info['alt'] = parse_float(str(message['altitude']))
-    if 'speed' in message:
-        drone_info['speed'] = parse_float(str(message['speed']))
-    if 'vert_speed' in message:
-        drone_info['vspeed'] = parse_float(str(message['vert_speed']))
-    if 'height' in message:
-        drone_info['height'] = parse_float(str(message['height']))
-
-    # Pilot lat/lon
-    if 'pilot_lat' in message:
-        drone_info['pilot_lat'] = parse_float(str(message['pilot_lat']))
-    if 'pilot_lon' in message:
-        drone_info['pilot_lon'] = parse_float(str(message['pilot_lon']))
-
-    # Top-level 'description'
-    if 'description' in message:
-        drone_info['description'] = message['description']
-    else:
-        drone_info['description'] = message.get('Self-ID Message', {}).get('text', "")
-
-    return drone_info
 
 def parse_list_format(message_list: list) -> dict:
     """Parses Bluetooth formatted drone data (list of dicts) and extracts relevant information including MAC address."""
     drone_info = {}
     drone_info['mac'] = None
+    serial_number = None
+    caa_id = None
+    descriptions = set()  # Use a set to accumulate unique descriptions
 
     for item in message_list:
         if not isinstance(item, dict):
@@ -305,18 +305,34 @@ def parse_list_format(message_list: list) -> dict:
 
         # Basic ID
         if 'Basic ID' in item:
-            id_type = item['Basic ID'].get('id_type')
-            if id_type == 'Serial Number (ANSI/CTA-2063-A)' and 'id' not in drone_info:
-                drone_info['id'] = item['Basic ID'].get('id', 'unknown')
-            elif id_type == 'CAA Assigned Registration ID' and 'id' not in drone_info:
-                drone_info['id'] = item['Basic ID'].get('id', 'unknown')
+            id_type = item['Basic ID'].get('id_type', '').strip().lower()
+            current_id = item['Basic ID'].get('id', 'unknown').strip()
+
+            if id_type == 'serial number (ansi/cta-2063-a)':
+                serial_number = current_id
+                logger.debug(f"Parsed Serial Number: {current_id}")
+            elif id_type == 'caa assigned registration id':
+                caa_id = current_id
+                descriptions.add(caa_id)  # Add only the CAA number
+                logger.debug(f"Parsed CAA Assigned Registration ID: {caa_id}")
 
             # Extract MAC address
-            mac = item['Basic ID'].get('MAC')
+            mac = item['Basic ID'].get('MAC', '').strip()
             if mac and is_valid_mac(mac):
                 drone_info['mac'] = mac.lower()  # Standardize to lowercase
+                logger.debug(f"Parsed MAC address: {mac.lower()}")
             else:
                 logger.debug(f"Invalid or missing MAC address in Bluetooth message: '{mac}'.")
+
+        # Operator ID Message (FAA Info) - Excluded from description
+        # Commented out to prevent adding to description
+        # if 'Operator ID Message' in item:
+        #     operator_id_type = item['Operator ID Message'].get('operator_id_type', '').strip().lower()
+        #     operator_id = item['Operator ID Message'].get('operator_id', '').strip()
+        #     if operator_id_type == 'operator id' and operator_id:
+        #         # Add FAA Operator ID to description
+        #         descriptions.add(operator_id)
+        #         logger.debug(f"Added Operator ID to description: {operator_id}")
 
         # Location/Vector
         if 'Location/Vector Message' in item:
@@ -327,16 +343,121 @@ def parse_list_format(message_list: list) -> dict:
             drone_info['vspeed'] = parse_float(str(loc_vec.get('vert_speed', "0.0")))
             drone_info['alt'] = parse_float(str(loc_vec.get('geodetic_altitude', "0.0")))
             drone_info['height'] = parse_float(str(loc_vec.get('height_agl', "0.0")))
+            logger.debug(f"Parsed Location/Vector Message: lat={drone_info['lat']}, lon={drone_info['lon']}")
 
-        # Self-ID
-        if 'Self-ID Message' in item:
-            drone_info['description'] = item['Self-ID Message'].get('text', "")
+        # Self-ID - Excluded from description
+        # Commented out to prevent adding to description
+        # if 'Self-ID Message' in item:
+        #     self_id_text = item['Self-ID Message'].get('text', "").strip()
+        #     if self_id_text:
+        #         descriptions.add(self_id_text)
+        #         logger.debug(f"Added Self-ID Message to description: {self_id_text}")
 
-        # System
+        # System - Not adding to description
         if 'System Message' in item:
             sysm = item['System Message']
             drone_info['pilot_lat'] = parse_float(sysm.get('latitude', "0.0"))
             drone_info['pilot_lon'] = parse_float(sysm.get('longitude', "0.0"))
+            logger.debug(f"Parsed System Message: pilot_lat={drone_info['pilot_lat']}, pilot_lon={drone_info['pilot_lon']}")
+
+    # Combine all descriptions into a single string
+    if descriptions:
+        drone_info['description'] = "; ".join(sorted(descriptions))
+        logger.debug(f"Combined descriptions: {drone_info['description']}")
+    else:
+        drone_info['description'] = ""
+
+    # Now, set 'id' as 'serial_number' if exists
+    if serial_number:
+        drone_info['id'] = serial_number
+        drone_info['id_type'] = 'Serial Number'
+
+    return drone_info
+
+def parse_esp32_dict(message: dict) -> dict:
+    """Parses ESP32 formatted drone data (single dict) and extracts relevant information including MAC address."""
+    drone_info = {}
+    descriptions = set()  # Use a set to accumulate unique descriptions
+
+    # Check for 'Basic ID'
+    if 'Basic ID' in message:
+        id_type = message['Basic ID'].get('id_type', '').strip().lower()
+        if id_type == 'serial number (ansi/cta-2063-a)':
+            drone_info['id'] = message['Basic ID'].get('id', 'unknown').strip()
+            drone_info['id_type'] = 'Serial Number'
+            logger.debug(f"Parsed Serial Number: {drone_info['id']}")
+        elif id_type == 'caa assigned registration id':
+            caa_assigned_number = message['Basic ID'].get('id', 'unknown').strip()
+            descriptions.add(caa_assigned_number)  # Add only the CAA number
+            drone_info['id_type'] = 'CAA Assigned'
+            # Do not set 'id' for CAA Assigned ID
+            logger.debug(f"Parsed CAA Assigned Registration ID: {caa_assigned_number}")
+
+        # Extract MAC address
+        mac = message['Basic ID'].get('MAC', '').strip()
+        if mac and is_valid_mac(mac):
+            drone_info['mac'] = mac.lower()  # Standardize to lowercase
+            logger.debug(f"Parsed MAC address: {mac.lower()}")
+        else:
+            logger.debug(f"Invalid or missing MAC address in ESP32 message: '{mac}'.")
+
+    # Custom 'drone_id' key (if exists and 'id' not already set) - Excluded from description
+    # Commented out to prevent adding to description
+    # if 'drone_id' in message and 'id' not in drone_info:
+    #     drone_info['id'] = message['drone_id'].strip()
+    #     drone_info['id_type'] = 'Other'
+    #     logger.debug(f"Parsed custom drone_id: {drone_info['id']}")
+
+    # Parse location data
+    if 'latitude' in message:
+        drone_info['lat'] = parse_float(str(message['latitude']))
+        logger.debug(f"Parsed latitude: {drone_info['lat']}")
+    if 'longitude' in message:
+        drone_info['lon'] = parse_float(str(message['longitude']))
+        logger.debug(f"Parsed longitude: {drone_info['lon']}")
+    if 'altitude' in message:
+        drone_info['alt'] = parse_float(str(message['altitude']))
+        logger.debug(f"Parsed altitude: {drone_info['alt']}")
+    if 'speed' in message:
+        drone_info['speed'] = parse_float(str(message['speed']))
+        logger.debug(f"Parsed speed: {drone_info['speed']}")
+    if 'vert_speed' in message:
+        drone_info['vspeed'] = parse_float(str(message['vert_speed']))
+        logger.debug(f"Parsed vertical speed: {drone_info['vspeed']}")
+    if 'height' in message:
+        drone_info['height'] = parse_float(str(message['height']))
+        logger.debug(f"Parsed height: {drone_info['height']}")
+
+    # Pilot lat/lon
+    if 'pilot_lat' in message:
+        drone_info['pilot_lat'] = parse_float(str(message['pilot_lat']))
+        logger.debug(f"Parsed pilot_lat: {drone_info['pilot_lat']}")
+    if 'pilot_lon' in message:
+        drone_info['pilot_lon'] = parse_float(str(message['pilot_lon']))
+        logger.debug(f"Parsed pilot_lon: {drone_info['pilot_lon']}")
+
+    # Top-level 'description' - Excluded from description
+    # Commented out to prevent adding to description
+    # if 'description' in message:
+    #     descriptions.add(message['description'].strip())
+    #     logger.debug(f"Added top-level description: {message['description'].strip()}")
+    # else:
+    #     # Append 'Self-ID Message' if exists
+    #     self_id_text = message.get('Self-ID Message', {}).get('text', "").strip()
+    #     if self_id_text:
+    #         descriptions.add(self_id_text)
+    #         logger.debug(f"Added Self-ID Message to description: {self_id_text}")
+
+    # Combine all descriptions into a single string
+    if descriptions:
+        drone_info['description'] = "; ".join(sorted(descriptions))
+        logger.debug(f"Combined descriptions: {drone_info['description']}")
+    else:
+        drone_info['description'] = ""
+
+    # Now, set 'id' as 'serial_number' if exists
+    if 'id' in drone_info and drone_info['id']:
+        drone_info['id_type'] = 'Serial Number'
 
     return drone_info
 
@@ -366,6 +487,7 @@ def zmq_to_json(zmqsetting: str, file: str, max_age: float, max_drones: int = 30
     while True:
         try:
             message = zmq_socket.recv_json()
+            logger.debug(f"Received message: {message}")
         except Exception as e:
             logger.error(f"Error receiving JSON from ZMQ: {e}")
             continue
@@ -385,14 +507,14 @@ def zmq_to_json(zmqsetting: str, file: str, max_age: float, max_drones: int = 30
             logger.error(f"Error parsing incoming message: {e}")
             continue
 
-        # Ensure both 'id' and 'mac' are present
-        if 'id' in drone_info and 'mac' in drone_info and drone_info['mac']:
-            # Prefix with 'drone-' if not already
-            if not drone_info['id'].startswith('drone-'):
-                drone_info['id'] = f"drone-{drone_info['id']}"
+        # Debug: Verify drone_info contents
+        logger.debug(f"Drone Info before condition: id={drone_info.get('id')}, mac={drone_info.get('mac')}")
 
+        # Ensure 'mac' is present
+        if 'mac' in drone_info and drone_info['mac']:
             # Add a 'time' field in ISO8601 for tar1090 ingestion
             drone_info['time'] = iso_timestamp_now()
+            logger.debug(f"Added timestamp: {drone_info['time']}")
 
             # Update or add the main drone based on MAC address
             main_drone_id = drone_manager.update_or_add_main_drone(drone_info)
@@ -408,7 +530,7 @@ def zmq_to_json(zmqsetting: str, file: str, max_age: float, max_drones: int = 30
 
                 # If main drone lat/lon is invalid, skip adding the drone and remove any existing pilot
                 if not is_valid_latlon(main_lat, main_lon):
-                    logger.debug(f"Skipping drone {drone_info['id']} - invalid lat/lon: ({main_lat}, {main_lon})")
+                    logger.info(f"Skipping drone {drone_info.get('id')} - invalid lat/lon: ({main_lat}, {main_lon})")
                     # Remove any existing pilot entry
                     drone_manager.update_or_add_pilot_drone(main_drone_id, {'pilot_lat': 0.0, 'pilot_lon': 0.0, 'time': drone_info['time']})
                     continue
@@ -416,20 +538,20 @@ def zmq_to_json(zmqsetting: str, file: str, max_age: float, max_drones: int = 30
                 # Update or add the pilot drone based on pilot coordinates
                 drone_manager.update_or_add_pilot_drone(main_drone_id, drone_info)
 
-            else:
-                # If main_drone_id is None, skip pilot handling
-                continue
+            # After updating, write JSON
+            # Create backup only if verbose logging is enabled
+            create_backup = logger.level == logging.DEBUG
+            drone_manager.send_updates(file, create_backup=create_backup)
 
+            # Remove any drones that haven't been updated for > max_age seconds
+            drone_manager.remove_old_drones(max_age)
         else:
-            logger.debug("No valid 'id' or 'mac' found in message. Skipping...")
+            logger.debug("No valid 'mac' found in message. Skipping...")
 
-        # After updating, write JSON
-        drone_manager.send_updates(file)
+        # Optional: Throttle burst processing to prevent rapid overwriting
+        # time.sleep(0.1)  # 100 milliseconds delay
 
-        # Remove any drones that haven't been updated for > max_age seconds
-        drone_manager.remove_old_drones(max_age)
-
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="ZMQ to JSON for tar1090, handling standard & ESP32 formats with MAC-based consolidation.")
     parser.add_argument("--zmqsetting", default="127.0.0.1:4224", help="Define ZMQ server to connect to (default=127.0.0.1:4224)")
     parser.add_argument("--json-file", default="/run/readsb/drone.json", help="JSON file to write parsed data to. (default=/run/readsb/drone.json)")
@@ -440,9 +562,13 @@ if __name__ == "__main__":
 
     # Configure logging level and format
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=logging.DEBUG if args.verbose else logging.WARNING,
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
-    logger.info(f"Starting ZMQ to JSON with log level: {'DEBUG' if args.verbose else 'INFO'}")
+    logger.info(f"Starting ZMQ to JSON with log level: {'DEBUG' if args.verbose else 'WARNING'}")
 
     zmq_to_json(args.zmqsetting, args.json_file, args.max_age, args.max_drones)
+
+if __name__ == "__main__":
+    main()
+
