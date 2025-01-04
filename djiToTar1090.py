@@ -5,7 +5,7 @@ DjiToTar1090.py
 Author: CemaXecuter
 Description: Connects to AntSDR to receive DJI DroneID data, parses it,
              and writes it to /run/readsb/dji_drone.json in a format compatible with tar1090.
-
+             Also plots pilot information if available.
 Usage:
     python3 DjiToTar1090.py
 
@@ -26,7 +26,7 @@ import threading
 
 # Configuration Constants
 ANTSDR_IP = "192.168.1.10"               # Default AntSDR IP
-ANTSDR_PORT = 41030                       # Default AntSDR Port
+ANTSDR_PORT = 41030                      # Default AntSDR Port
 JSON_FILE_PATH = "/run/readsb/dji_drone.json"  # Output JSON file
 RECONNECT_DELAY = 5                       # Seconds to wait before reconnecting
 WRITE_INTERVAL = 1                        # Seconds between JSON writes
@@ -105,7 +105,7 @@ def parse_dji_data(data: bytes) -> dict:
 
     # Validate latitude and longitude
     if not is_valid_latlon(drone_lat, drone_lon):
-        logging.warning(f"Invalid latitude or longitude received: lat={drone_lat}, lon={drone_lon}")
+        logging.warning(f"Invalid drone latitude or longitude received: lat={drone_lat}, lon={drone_lon}")
         return {}
 
     # Construct drone information dictionary
@@ -123,11 +123,29 @@ def parse_dji_data(data: bytes) -> dict:
         "rssi": rssi                                       # RSSI value
     }
 
-    return drone_info
+    # Construct pilot information dictionary if pilot data is valid
+    if is_valid_latlon(app_lat, app_lon):
+        pilot_id = f"pilot-{serial_number}"              # Unique ID for the pilot
+        pilot_info = {
+            "id": pilot_id,                                # Unique Pilot ID
+            "callsign": pilot_id,                          # Pilot Callsign
+            "time": iso_timestamp_now(),                   # Current UTC time
+            "lat": app_lat,
+            "lon": app_lon,
+            "speed": 0,                                     # Pilots might not have speed data
+            "vspeed": 0,                                    # Pilots might not have vspeed data
+            "alt": altitude,                                # Same altitude as drone
+            "height": height,                               # Same height as drone
+            "description": "Pilot",                         # Description for pilot
+            "rssi": rssi                                    # RSSI value (optional)
+        }
+        return drone_info, pilot_info
+    else:
+        return drone_info, None
 
-def listen_to_antsdr(ip: str, port: int, drones: dict):
+def listen_to_antsdr(ip: str, port: int, drones: dict, pilots: dict):
     """
-    Connects to AntSDR, receives data, parses it, and updates the drones dictionary.
+    Connects to AntSDR, receives data, parses it, and updates the drones and pilots dictionaries.
     """
     while True:
         try:
@@ -150,11 +168,28 @@ def listen_to_antsdr(ip: str, port: int, drones: dict):
                         while b'\n' in buffer:
                             frame, buffer = buffer.split(b'\n', 1)
                             if frame:
-                                drone_info = parse_dji_data(frame)
+                                result = parse_dji_data(frame)
+                                if isinstance(result, tuple):
+                                    drone_info, pilot_info = result
+                                else:
+                                    drone_info, pilot_info = result, None
+
                                 if drone_info:
                                     serial = drone_info["id"]
                                     drones[serial] = drone_info
                                     logging.debug(f"Updated drone: {serial}")
+                                
+                                if pilot_info:
+                                    pilot_id = pilot_info["id"]
+                                    pilots[pilot_id] = pilot_info
+                                    logging.debug(f"Updated pilot: {pilot_id}")
+                                else:
+                                    # If pilot_info is None, remove the pilot entry if it exists
+                                    # Assuming pilot_id is "pilot-<serial_number>"
+                                    pilot_id = f"pilot-{serial}"
+                                    if pilot_id in pilots:
+                                        del pilots[pilot_id]
+                                        logging.debug(f"Removed pilot: {pilot_id}")
                     except socket.timeout:
                         logging.warning("Socket timeout. No data received.")
                         continue
@@ -170,27 +205,30 @@ def listen_to_antsdr(ip: str, port: int, drones: dict):
 
 def main():
     """
-    Main function to initialize drone data collection and JSON writing.
+    Main function to initialize drone and pilot data collection and JSON writing.
     """
-    # Dictionary to store active drones, keyed by serial number
+    # Dictionaries to store active drones and pilots, keyed by their unique IDs
     drones = {}
+    pilots = {}
 
     # Start AntSDR listener in a separate thread
     listener_thread = threading.Thread(
         target=listen_to_antsdr,
-        args=(ANTSDR_IP, ANTSDR_PORT, drones),
+        args=(ANTSDR_IP, ANTSDR_PORT, drones, pilots),
         daemon=True
     )
     listener_thread.start()
     logging.info("Started AntSDR listener thread.")
 
-    # Main loop to periodically write drones data to JSON
+    # Main loop to periodically write drones and pilots data to JSON
     try:
         while True:
-            # Convert drones dictionary to a list
-            drones_list = list(drones.values())
-            write_atomic(JSON_FILE_PATH, drones_list)
-            logging.debug(f"Wrote {len(drones_list)} drones to JSON.")
+            # Combine drones and pilots into a single list
+            combined_data = list(drones.values()) + list(pilots.values())
+
+            # Write the combined data to JSON atomically
+            write_atomic(JSON_FILE_PATH, combined_data)
+            logging.debug(f"Wrote {len(drones)} drones and {len(pilots)} pilots to JSON.")
             time.sleep(WRITE_INTERVAL)
     except KeyboardInterrupt:
         logging.info("Script interrupted by user. Exiting...")
