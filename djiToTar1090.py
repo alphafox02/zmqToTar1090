@@ -61,8 +61,8 @@ def iso_timestamp_now() -> str:
     return datetime.datetime.utcnow().isoformat(timespec='milliseconds') + 'Z'
 
 def is_valid_latlon(lat: float, lon: float) -> bool:
-    """Check if latitude and longitude are within valid ranges."""
-    return -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0
+    """Check if latitude and longitude are within valid ranges and not zero."""
+    return (-90.0 <= lat <= 90.0 and lat != 0.0) and (-180.0 <= lon <= 180.0 and lon != 0.0)
 
 def write_atomic(file_path: str, data: list):
     """
@@ -149,7 +149,7 @@ def tcp_client(debug: bool):
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         client_socket.connect((server_ip, server_port))
-        logging.debug(f"Connect server success {server_ip}:{server_port}")
+        logging.debug(f"Connected to server {server_ip}:{server_port}")
 
         while True:
             frame = client_socket.recv(1024)
@@ -196,7 +196,7 @@ def tcp_client(debug: bool):
         logging.debug(f"recv error: {e}")
     finally:
         client_socket.close()
-        logging.debug("disconnect")
+        logging.debug("Disconnected from AntSDR.")
 
 def parse_args():
     """
@@ -263,22 +263,30 @@ def main():
                 }
                 combined_data.append(drone_entry)
 
-            # Add pilot entries
+            # Add pilot entries only if they exist and have valid coordinates
             for pilot in pilots.values():
-                pilot_entry = {
-                    "id": pilot["id"],
-                    "callsign": pilot["callsign"],
-                    "time": pilot["time"],
-                    "lat": pilot["lat"],
-                    "lon": pilot["lon"],
-                    "speed": pilot["speed"],
-                    "vspeed": pilot["vspeed"],
-                    "alt": pilot["alt"],
-                    "height": pilot["height"],
-                    "description": pilot["description"] if pilot["description"] else "DJI Drone",
-                    "RSSI": pilot["RSSI"]
-                }
-                combined_data.append(pilot_entry)
+                # Double-check that pilot lat and lon are valid
+                if is_valid_latlon(pilot["lat"], pilot["lon"]):
+                    pilot_entry = {
+                        "id": pilot["id"],
+                        "callsign": pilot["callsign"],
+                        "time": pilot["time"],
+                        "lat": pilot["lat"],
+                        "lon": pilot["lon"],
+                        "speed": pilot["speed"],
+                        "vspeed": pilot["vspeed"],
+                        "alt": pilot["alt"],
+                        "height": pilot["height"],
+                        "description": pilot["description"] if pilot["description"] else "DJI Drone",
+                        "RSSI": pilot["RSSI"]
+                    }
+                    combined_data.append(pilot_entry)
+                else:
+                    # If pilot coordinates are invalid, ensure they are not in pilots dict
+                    pilot_id = pilot["id"]
+                    if pilot_id in pilots:
+                        del pilots[pilot_id]
+                        logging.debug(f"Removed invalid Pilot Data - {pilot_id}")
 
             # Write the combined data to JSON atomically
             write_atomic(JSON_FILE_PATH, combined_data)
@@ -293,4 +301,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
