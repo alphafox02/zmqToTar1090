@@ -117,10 +117,14 @@ def parse_dji_data(data: bytes) -> tuple:
         speed_E = struct.unpack('d', data[201:209])[0]
         speed_N = struct.unpack('d', data[209:217])[0]
         speed_U = struct.unpack('d', data[217:225])[0]
-        rssi = struct.unpack('h', data[225:227])[0]  # Corrected indexing to 2 bytes
+        rssi = struct.unpack('h', data[225:227])[0]  # Corrected to 2 bytes
     except (UnicodeDecodeError, struct.error) as e:
         logging.error(f"Error parsing DJI DroneID data: {e}")
-        return {}, None
+        # Assign default or placeholder values in case of error
+        serial_number = "Unknown"
+        device_type = "Got a DJI drone with encryption"
+        device_type_8 = 255
+        app_lat = app_lon = drone_lat = drone_lon = height = altitude = home_lat = home_lon = freq = speed_E = speed_N = speed_U = rssi = 0
 
     # Validate drone latitude and longitude
     if not is_valid_latlon(drone_lat, drone_lon):
@@ -209,7 +213,6 @@ def listen_to_antsdr(ip: str, port: int, drones: dict, pilots: dict, debug: bool
                                             if pilot_id in pilots:
                                                 del pilots[pilot_id]
                                                 logging.debug(f"Removed pilot: {pilot_id}")
-            # If connection is lost, wait before reconnecting
         except (ConnectionRefusedError, socket.error) as e:
             logging.error(f"Connection error: {e}. Retrying in {RECONNECT_DELAY} seconds...")
             time.sleep(RECONNECT_DELAY)
