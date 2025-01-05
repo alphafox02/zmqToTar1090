@@ -5,8 +5,7 @@ DjiToTar1090.py
 Author: CemaXecuter
 Description: Connects to AntSDR to receive DJI DroneID data, parses it,
              and writes it to /run/readsb/dji_drone.json in a format compatible with tar1090.
-             Also includes pilot information if available.
-
+             Includes pilot information only if valid.
 Usage:
     python3 DjiToTar1090.py [-d]
 
@@ -17,6 +16,7 @@ Requirements:
     - Python 3.6+
     - Write permissions to /run/readsb/dji_drone.json
 """
+
 import socket
 import struct
 import json
@@ -35,7 +35,6 @@ ANTSDR_PORT = 41030                      # Default AntSDR Port
 JSON_FILE_PATH = "/run/readsb/dji_drone.json"  # Output JSON file
 RECONNECT_DELAY = 5                       # Seconds to wait before reconnecting
 WRITE_INTERVAL = 1                        # Seconds between JSON writes
-EXPECTED_FRAME_SIZE = 227                  # Expected bytes per frame
 
 # Shared data structures
 drones = {}
@@ -46,20 +45,15 @@ def setup_logging(debug: bool):
     Configures logging based on the debug flag.
 
     Args:
-        debug (bool): If True, sets logging level to DEBUG and logs to both file and console.
-                      If False, sets logging level to WARNING and logs only to file.
+        debug (bool): If True, sets logging level to DEBUG and logs to console.
+                      If False, sets logging level to WARNING and logs to console.
     """
     log_level = logging.DEBUG if debug else logging.WARNING
-    log_handlers = [logging.FileHandler("drone.log")]
-
-    if debug:
-        log_handlers.append(logging.StreamHandler(sys.stdout))
-
     logging.basicConfig(
         level=log_level,
         format='%(asctime)s [%(levelname)s] %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
-        handlers=log_handlers
+        handlers=[logging.StreamHandler(sys.stdout)]
     )
 
 def iso_timestamp_now() -> str:
@@ -94,7 +88,7 @@ def parse_frame(frame):
     length_bytes = frame[3:5]
     # struct.unpack parse uint16_t
     package_length = struct.unpack('H', length_bytes)[0]
-    print(f"package_length: {package_length}")
+    logging.debug(f"package_length: {package_length}")
     data = frame[5:5 + package_length - 5]
     return package_type, data
 
@@ -117,7 +111,7 @@ def parse_data_1(data):
         speed_U = struct.unpack('d', data[217:225])[0]
         rssi = struct.unpack('h', data[225:227])[0]  # Corrected slicing to 2 bytes
     except UnicodeDecodeError:
-        device_type = "Got a dji drone with encryption"
+        device_type = "DJI Drone"
         device_type_8 = 255
         # Initialize all other fields to default values to prevent NameError
         serial_number = "Unknown"
@@ -171,7 +165,7 @@ def tcp_client(debug: bool):
                     logging.debug(f"{key}: {value}")
                 logging.debug("*****************\n")
 
-                # Update drones and pilots dictionaries
+                # Update drones dictionary
                 serial = parsed_data["serial_number"]
                 drones[serial] = parsed_data
 
@@ -180,7 +174,7 @@ def tcp_client(debug: bool):
                     pilot_id = f"pilot-{serial}"
                     pilots[pilot_id] = {
                         "id": pilot_id,
-                        "callsign": pilot_id,
+                        "callsign": serial,  # Using serial number as callsign
                         "time": iso_timestamp_now(),
                         "lat": parsed_data["app_lat"],
                         "lon": parsed_data["app_lon"],
@@ -188,7 +182,7 @@ def tcp_client(debug: bool):
                         "vspeed": 0,         # Assuming no vertical speed data for pilot
                         "alt": parsed_data["altitude"],
                         "height": parsed_data["height"],
-                        "description": "Pilot",
+                        "description": parsed_data["device_type"] if parsed_data["device_type"] else "DJI Drone",
                         "RSSI": parsed_data["RSSI"]
                     }
                     logging.debug(f"Pilot Data - {pilot_id}: {pilots[pilot_id]}")
@@ -198,7 +192,6 @@ def tcp_client(debug: bool):
                     if pilot_id in pilots:
                         del pilots[pilot_id]
                         logging.debug(f"Removed Pilot Data - {pilot_id}")
-
     except Exception as e:
         logging.debug(f"recv error: {e}")
     finally:
@@ -252,7 +245,40 @@ def main():
     try:
         while True:
             # Combine drones and pilots into a single list
-            combined_data = list(drones.values()) + list(pilots.values())
+            combined_data = []
+
+            # Add drone entries
+            for drone in drones.values():
+                drone_entry = {
+                    "id": drone["serial_number"],
+                    "callsign": drone["serial_number"],
+                    "time": iso_timestamp_now(),
+                    "lat": drone["drone_lat"],
+                    "lon": drone["drone_lon"],
+                    "speed": 0,          # Assuming no speed data for drone
+                    "vspeed": 0,         # Assuming no vertical speed data for drone
+                    "alt": drone["altitude"],
+                    "height": drone["height"],
+                    "description": drone["device_type"] if drone["device_type"] else "DJI Drone"
+                }
+                combined_data.append(drone_entry)
+
+            # Add pilot entries
+            for pilot in pilots.values():
+                pilot_entry = {
+                    "id": pilot["id"],
+                    "callsign": pilot["callsign"],
+                    "time": pilot["time"],
+                    "lat": pilot["lat"],
+                    "lon": pilot["lon"],
+                    "speed": pilot["speed"],
+                    "vspeed": pilot["vspeed"],
+                    "alt": pilot["alt"],
+                    "height": pilot["height"],
+                    "description": pilot["description"] if pilot["description"] else "DJI Drone",
+                    "RSSI": pilot["RSSI"]
+                }
+                combined_data.append(pilot_entry)
 
             # Write the combined data to JSON atomically
             write_atomic(JSON_FILE_PATH, combined_data)
@@ -267,3 +293,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
