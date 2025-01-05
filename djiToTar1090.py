@@ -6,8 +6,12 @@ Author: CemaXecuter
 Description: Connects to AntSDR to receive DJI DroneID data, parses it,
              and writes it to /run/readsb/dji_drone.json in a format compatible with tar1090.
              Also plots pilot information if available.
+
 Usage:
-    python3 DjiToTar1090.py
+    python3 DjiToTar1090.py [-d]
+
+Options:
+    -d, --debug    Enable debug mode for verbose output and raw data logging.
 
 Requirements:
     - Python 3.6+
@@ -23,20 +27,31 @@ import logging
 import os
 import sys
 import threading
+import argparse
 
-# Configuration Constants
-ANTSDR_IP = "192.168.1.10"               # Default AntSDR IP
-ANTSDR_PORT = 41030                      # Default AntSDR Port
+# Configuration Defaults
+DEFAULT_ANTSDR_IP = "192.168.1.10"       # Default AntSDR IP
+DEFAULT_ANTSDR_PORT = 41030              # Default AntSDR Port
 JSON_FILE_PATH = "/run/readsb/dji_drone.json"  # Output JSON file
 RECONNECT_DELAY = 5                       # Seconds to wait before reconnecting
 WRITE_INTERVAL = 1                        # Seconds between JSON writes
+EXPECTED_FRAME_SIZE = 227                 # Expected bytes per frame
 
-# Setup Logging to Console Only
-logging.basicConfig(
-    level=logging.INFO,  # Set to DEBUG for more detailed logs
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+def setup_logging(debug: bool):
+    """Configure logging based on debug flag."""
+    log_level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    # Also log to console if in debug mode
+    if debug:
+        console = logging.StreamHandler()
+        console.setLevel(log_level)
+        formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+        console.setFormatter(formatter)
+        logging.getLogger('').addHandler(console)
 
 def iso_timestamp_now() -> str:
     """Return current UTC time as an ISO8601 string with 'Z' suffix."""
@@ -60,7 +75,7 @@ def write_atomic(file_path: str, data: list):
     except Exception as e:
         logging.error(f"Failed to write JSON data: {e}")
 
-def parse_dji_data(data: bytes) -> dict:
+def parse_dji_data(data: bytes) -> tuple:
     """
     Parses binary DJI DroneID data from AntSDR.
 
@@ -83,9 +98,13 @@ def parse_dji_data(data: bytes) -> dict:
     - RSSI: bytes 225-226 (2 bytes, short)
     """
     try:
+        if len(data) < EXPECTED_FRAME_SIZE:
+            logging.error(f"Received data length {len(data)} is less than expected {EXPECTED_FRAME_SIZE}.")
+            return {}, None
+
         serial_number = data[0:64].decode('utf-8').rstrip('\x00')
         device_type = data[64:128].decode('utf-8').rstrip('\x00')
-        # device_type_8 = data[128]  # Currently not used
+        device_type_8 = data[128]
         app_lat = struct.unpack('d', data[129:137])[0]
         app_lon = struct.unpack('d', data[137:145])[0]
         drone_lat = struct.unpack('d', data[145:153])[0]
@@ -98,15 +117,15 @@ def parse_dji_data(data: bytes) -> dict:
         speed_E = struct.unpack('d', data[201:209])[0]
         speed_N = struct.unpack('d', data[209:217])[0]
         speed_U = struct.unpack('d', data[217:225])[0]
-        rssi = struct.unpack('h', data[225:227])[0]  # 2 bytes for 'h'
+        rssi = struct.unpack('h', data[225:227])[0]  # Corrected indexing to 2 bytes
     except (UnicodeDecodeError, struct.error) as e:
         logging.error(f"Error parsing DJI DroneID data: {e}")
-        return {}
+        return {}, None
 
-    # Validate latitude and longitude
+    # Validate drone latitude and longitude
     if not is_valid_latlon(drone_lat, drone_lon):
         logging.warning(f"Invalid drone latitude or longitude received: lat={drone_lat}, lon={drone_lon}")
-        return {}
+        return {}, None
 
     # Construct drone information dictionary
     drone_info = {
@@ -143,7 +162,7 @@ def parse_dji_data(data: bytes) -> dict:
     else:
         return drone_info, None
 
-def listen_to_antsdr(ip: str, port: int, drones: dict, pilots: dict):
+def listen_to_antsdr(ip: str, port: int, drones: dict, pilots: dict, debug: bool):
     """
     Connects to AntSDR, receives data, parses it, and updates the drones and pilots dictionaries.
     """
@@ -153,60 +172,69 @@ def listen_to_antsdr(ip: str, port: int, drones: dict, pilots: dict):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.connect((ip, port))
                 logging.info(f"Successfully connected to AntSDR at {ip}:{port}")
-                sock.settimeout(10.0)  # Timeout for socket operations
+                # Removed socket timeout to prevent premature disconnections
 
                 buffer = b''
                 while True:
                     try:
-                        data = sock.recv(4096)
+                        data = sock.recv(1024)
                         if not data:
                             logging.warning("AntSDR connection closed by the server.")
                             break
                         buffer += data
 
-                        # Assuming each frame is terminated by a newline character
-                        while b'\n' in buffer:
-                            frame, buffer = buffer.split(b'\n', 1)
-                            if frame:
-                                result = parse_dji_data(frame)
-                                if isinstance(result, tuple):
-                                    drone_info, pilot_info = result
-                                else:
-                                    drone_info, pilot_info = result, None
+                        # Log raw data if in debug mode
+                        if debug:
+                            logging.debug(f"Raw data received ({len(data)} bytes): {data.hex()}")
 
-                                if drone_info:
-                                    serial = drone_info["id"]
-                                    drones[serial] = drone_info
-                                    logging.debug(f"Updated drone: {serial}")
-                                
-                                if pilot_info:
-                                    pilot_id = pilot_info["id"]
-                                    pilots[pilot_id] = pilot_info
-                                    logging.debug(f"Updated pilot: {pilot_id}")
-                                else:
-                                    # If pilot_info is None, remove the pilot entry if it exists
-                                    # Assuming pilot_id is "pilot-<serial_number>"
-                                    pilot_id = f"pilot-{serial}"
-                                    if pilot_id in pilots:
-                                        del pilots[pilot_id]
-                                        logging.debug(f"Removed pilot: {pilot_id}")
-                    except socket.timeout:
-                        logging.warning("Socket timeout. No data received.")
-                        continue
-                    except Exception as e:
-                        logging.error(f"Error receiving data: {e}")
-                        break  # Exit to reconnect
-        except (ConnectionRefusedError, socket.timeout, socket.error) as e:
+                        # Process data in fixed-length frames
+                        while len(buffer) >= EXPECTED_FRAME_SIZE:
+                            frame = buffer[:EXPECTED_FRAME_SIZE]
+                            buffer = buffer[EXPECTED_FRAME_SIZE:]
+                            if frame:
+                                package_type, data = parse_frame(frame)
+                                if package_type == 0x01 and data:
+                                    parsed_data = parse_dji_data(data)
+                                    if parsed_data:
+                                        drones[parsed_data["id"]] = parsed_data
+                                        logging.debug(f"Updated drone: {parsed_data['id']}")
+                                        
+                                        # If pilot info exists, add/update it
+                                        if "callsign" in parsed_data and parsed_data["callsign"].startswith("pilot-"):
+                                            pilots[parsed_data["id"]] = parsed_data
+                                            logging.debug(f"Updated pilot: {parsed_data['id']}")
+                                        else:
+                                            # Remove pilot entry if no pilot data
+                                            pilot_id = f"pilot-{parsed_data['id']}"
+                                            if pilot_id in pilots:
+                                                del pilots[pilot_id]
+                                                logging.debug(f"Removed pilot: {pilot_id}")
+            # If connection is lost, wait before reconnecting
+        except (ConnectionRefusedError, socket.error) as e:
             logging.error(f"Connection error: {e}. Retrying in {RECONNECT_DELAY} seconds...")
             time.sleep(RECONNECT_DELAY)
         except Exception as e:
             logging.exception(f"Unexpected error: {e}. Retrying in {RECONNECT_DELAY} seconds...")
             time.sleep(RECONNECT_DELAY)
 
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Connect to AntSDR, parse DJI DroneID data, and output to tar1090-compatible JSON.")
+    parser.add_argument('-d', '--debug', action='store_true',
+                        help='Enable debug mode for verbose output and raw data logging.')
+    parser.add_argument('-i', '--ip', type=str, default=DEFAULT_ANTSDR_IP,
+                        help=f'Specify the AntSDR IP address. Default is {DEFAULT_ANTSDR_IP}.')
+    parser.add_argument('-p', '--port', type=int, default=DEFAULT_ANTSDR_PORT,
+                        help=f'Specify the AntSDR port. Default is {DEFAULT_ANTSDR_PORT}.')
+    return parser.parse_args()
+
 def main():
     """
     Main function to initialize drone and pilot data collection and JSON writing.
     """
+    args = parse_args()
+    setup_logging(args.debug)
+
     # Dictionaries to store active drones and pilots, keyed by their unique IDs
     drones = {}
     pilots = {}
@@ -214,7 +242,7 @@ def main():
     # Start AntSDR listener in a separate thread
     listener_thread = threading.Thread(
         target=listen_to_antsdr,
-        args=(ANTSDR_IP, ANTSDR_PORT, drones, pilots),
+        args=(args.ip, args.port, drones, pilots, args.debug),
         daemon=True
     )
     listener_thread.start()
