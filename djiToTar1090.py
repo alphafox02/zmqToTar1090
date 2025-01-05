@@ -28,14 +28,15 @@ import os
 import sys
 import threading
 import argparse
+import signal
 
 # Configuration Defaults
-DEFAULT_ANTSDR_IP = "192.168.1.10"       # Default AntSDR IP
-DEFAULT_ANTSDR_PORT = 41030              # Default AntSDR Port
+DEFAULT_ANTSDR_IP = "192.168.1.10"          # Default AntSDR IP
+DEFAULT_ANTSDR_PORT = 41030                 # Default AntSDR Port
 JSON_FILE_PATH = "/run/readsb/dji_drone.json"  # Output JSON file
-RECONNECT_DELAY = 5                       # Seconds to wait before reconnecting
-WRITE_INTERVAL = 1                        # Seconds between JSON writes
-EXPECTED_FRAME_SIZE = 227                 # Expected bytes per frame
+RECONNECT_DELAY = 5                          # Seconds to wait before reconnecting
+WRITE_INTERVAL = 1                           # Seconds between JSON writes
+EXPECTED_FRAME_SIZE = 227                    # Expected bytes per frame
 
 def setup_logging(debug: bool):
     """Configure logging based on debug flag."""
@@ -198,21 +199,23 @@ def listen_to_antsdr(ip: str, port: int, drones: dict, pilots: dict, debug: bool
                             if frame:
                                 package_type, data = parse_frame(frame)
                                 if package_type == 0x01 and data:
-                                    parsed_data = parse_dji_data(data)
+                                    parsed_data, pilot_info = parse_dji_data(data)
                                     if parsed_data:
                                         drones[parsed_data["id"]] = parsed_data
                                         logging.debug(f"Updated drone: {parsed_data['id']}")
-                                        
-                                        # If pilot info exists, add/update it
-                                        if "callsign" in parsed_data and parsed_data["callsign"].startswith("pilot-"):
-                                            pilots[parsed_data["id"]] = parsed_data
-                                            logging.debug(f"Updated pilot: {parsed_data['id']}")
+
+                                        if pilot_info:
+                                            pilots[pilot_info["id"]] = pilot_info
+                                            logging.debug(f"Updated pilot: {pilot_info['id']}")
                                         else:
                                             # Remove pilot entry if no pilot data
                                             pilot_id = f"pilot-{parsed_data['id']}"
                                             if pilot_id in pilots:
                                                 del pilots[pilot_id]
                                                 logging.debug(f"Removed pilot: {pilot_id}")
+                    except Exception as e_inner:
+                        logging.error(f"Error receiving data: {e_inner}")
+                        break  # Exit the inner loop to reconnect
         except (ConnectionRefusedError, socket.error) as e:
             logging.error(f"Connection error: {e}. Retrying in {RECONNECT_DELAY} seconds...")
             time.sleep(RECONNECT_DELAY)
@@ -231,12 +234,21 @@ def parse_args():
                         help=f'Specify the AntSDR port. Default is {DEFAULT_ANTSDR_PORT}.')
     return parser.parse_args()
 
+def handle_shutdown(signum, frame):
+    """Handle shutdown signals for graceful exit."""
+    logging.info("Shutdown signal received. Exiting gracefully...")
+    sys.exit(0)
+
 def main():
     """
     Main function to initialize drone and pilot data collection and JSON writing.
     """
     args = parse_args()
     setup_logging(args.debug)
+
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, handle_shutdown)   # Handle Ctrl+C
+    signal.signal(signal.SIGTERM, handle_shutdown)  # Handle termination signals
 
     # Dictionaries to store active drones and pilots, keyed by their unique IDs
     drones = {}
