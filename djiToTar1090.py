@@ -30,11 +30,11 @@ import argparse
 import signal
 
 # Configuration Constants
-ANTSDR_IP = "192.168.1.10"               # Default AntSDR IP
-ANTSDR_PORT = 41030                      # Default AntSDR Port
+ANTSDR_IP = "192.168.1.10"                   # Default AntSDR IP
+ANTSDR_PORT = 41030                          # Default AntSDR Port
 JSON_FILE_PATH = "/run/readsb/dji_drone.json"  # Output JSON file
-RECONNECT_DELAY = 5                       # Seconds to wait before reconnecting
-WRITE_INTERVAL = 1                        # Seconds between JSON writes
+RECONNECT_DELAY = 5                           # Seconds to wait before reconnecting
+WRITE_INTERVAL = 1                            # Seconds between JSON writes
 
 # Shared data structures
 drones = {}
@@ -259,12 +259,13 @@ def main():
                     "vspeed": 0,         # Assuming no vertical speed data for drone
                     "alt": drone["altitude"],
                     "height": drone["height"],
-                    "description": drone["device_type"] if drone["device_type"] else "DJI Drone"
+                    "description": drone["device_type"] if drone["device_type"] else "DJI Drone",
+                    "RSSI": drone["RSSI"]  # Added RSSI to drone entry
                 }
                 combined_data.append(drone_entry)
 
             # Add pilot entries only if they exist and have valid coordinates
-            for pilot in pilots.values():
+            for pilot in list(pilots.values()):
                 # Double-check that pilot lat and lon are valid
                 if is_valid_latlon(pilot["lat"], pilot["lon"]):
                     pilot_entry = {
