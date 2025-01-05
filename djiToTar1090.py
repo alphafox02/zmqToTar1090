@@ -17,7 +17,6 @@ Requirements:
     - Python 3.6+
     - Write permissions to /run/readsb/dji_drone.json
 """
-
 import socket
 import struct
 import json
@@ -31,12 +30,12 @@ import argparse
 import signal
 
 # Configuration Defaults
-DEFAULT_ANTSDR_IP = "192.168.1.10"          # Default AntSDR IP
-DEFAULT_ANTSDR_PORT = 41030                 # Default AntSDR Port
-JSON_FILE_PATH = "/run/readsb/dji_drone.json"  # Output JSON file
-RECONNECT_DELAY = 5                          # Seconds to wait before reconnecting
-WRITE_INTERVAL = 1                           # Seconds between JSON writes
-EXPECTED_FRAME_SIZE = 227                    # Expected bytes per frame
+DEFAULT_ANTSDR_IP = "192.168.1.10"            # Default AntSDR IP
+DEFAULT_ANTSDR_PORT = 41030                   # Default AntSDR Port
+JSON_FILE_PATH = "/run/readsb/dji_drone.json" # Output JSON file
+RECONNECT_DELAY = 5                            # Seconds to wait before reconnecting
+WRITE_INTERVAL = 1                             # Seconds between JSON writes
+EXPECTED_FRAME_SIZE = 227                      # Expected bytes per frame
 
 def setup_logging(debug: bool):
     """Configure logging based on debug flag."""
@@ -44,15 +43,12 @@ def setup_logging(debug: bool):
     logging.basicConfig(
         level=log_level,
         format='%(asctime)s [%(levelname)s] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[
+            logging.FileHandler("dji_drone.log"),
+            logging.StreamHandler(sys.stdout) if debug else logging.NullHandler()
+        ]
     )
-    # Also log to console if in debug mode
-    if debug:
-        console = logging.StreamHandler()
-        console.setLevel(log_level)
-        formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-        console.setFormatter(formatter)
-        logging.getLogger('').addHandler(console)
 
 def iso_timestamp_now() -> str:
     """Return current UTC time as an ISO8601 string with 'Z' suffix."""
@@ -75,6 +71,35 @@ def write_atomic(file_path: str, data: list):
         logging.debug(f"Successfully wrote data to {file_path}")
     except Exception as e:
         logging.error(f"Failed to write JSON data: {e}")
+
+def parse_frame(frame: bytes) -> tuple:
+    """
+    Parse the incoming frame from AntSDR.
+
+    Returns:
+        package_type (int): The type of the package.
+        data (bytes): The data payload of the package.
+    """
+    if len(frame) < 5:
+        logging.error(f"Frame too short: {len(frame)} bytes")
+        return None, None
+
+    frame_header = frame[:2]
+    package_type = frame[2]
+    length_bytes = frame[3:5]
+    package_length = struct.unpack('H', length_bytes)[0]
+    logging.debug(f"Parsed Frame Header: {frame_header}")
+    logging.debug(f"Package Type: {package_type}")
+    logging.debug(f"Package Length: {package_length}")
+
+    # Ensure the frame has the expected length
+    expected_total_length = package_length
+    if len(frame) < expected_total_length:
+        logging.error(f"Incomplete frame received. Expected {expected_total_length} bytes, got {len(frame)} bytes.")
+        return None, None
+
+    data = frame[5:expected_total_length]
+    return package_type, data
 
 def parse_dji_data(data: bytes) -> tuple:
     """
@@ -197,9 +222,9 @@ def listen_to_antsdr(ip: str, port: int, drones: dict, pilots: dict, debug: bool
                             frame = buffer[:EXPECTED_FRAME_SIZE]
                             buffer = buffer[EXPECTED_FRAME_SIZE:]
                             if frame:
-                                package_type, data = parse_frame(frame)
-                                if package_type == 0x01 and data:
-                                    parsed_data, pilot_info = parse_dji_data(data)
+                                package_type, frame_data = parse_frame(frame)
+                                if package_type == 0x01 and frame_data:
+                                    parsed_data, pilot_info = parse_dji_data(frame_data)
                                     if parsed_data:
                                         drones[parsed_data["id"]] = parsed_data
                                         logging.debug(f"Updated drone: {parsed_data['id']}")
