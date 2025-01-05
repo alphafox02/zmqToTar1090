@@ -5,7 +5,7 @@ DjiToTar1090.py
 Author: CemaXecuter
 Description: Connects to AntSDR to receive DJI DroneID data, parses it,
              and writes it to /run/readsb/dji_drone.json in a format compatible with tar1090.
-             Also plots pilot information if available.
+             Also includes pilot information if available.
 
 Usage:
     python3 DjiToTar1090.py [-d]
@@ -29,35 +29,38 @@ import threading
 import argparse
 import signal
 
-# Configuration Defaults
-DEFAULT_ANTSDR_IP = "192.168.1.10"            # Default AntSDR IP
-DEFAULT_ANTSDR_PORT = 41030                   # Default AntSDR Port
-JSON_FILE_PATH = "/run/readsb/dji_drone.json" # Output JSON file
-RECONNECT_DELAY = 5                            # Seconds to wait before reconnecting
-WRITE_INTERVAL = 1                             # Seconds between JSON writes
-EXPECTED_FRAME_SIZE = 227                      # Expected bytes per frame
+# Configuration Constants
+ANTSDR_IP = "192.168.1.10"               # Default AntSDR IP
+ANTSDR_PORT = 41030                      # Default AntSDR Port
+JSON_FILE_PATH = "/run/readsb/dji_drone.json"  # Output JSON file
+RECONNECT_DELAY = 5                       # Seconds to wait before reconnecting
+WRITE_INTERVAL = 1                        # Seconds between JSON writes
+EXPECTED_FRAME_SIZE = 227                  # Expected bytes per frame
+
+# Shared data structures
+drones = {}
+pilots = {}
 
 def setup_logging(debug: bool):
-    """Configure logging based on debug flag."""
+    """
+    Configures logging based on the debug flag.
+
+    Args:
+        debug (bool): If True, sets logging level to DEBUG and logs to both file and console.
+                      If False, sets logging level to WARNING and logs only to file.
+    """
+    log_level = logging.DEBUG if debug else logging.WARNING
+    log_handlers = [logging.FileHandler("drone.log")]
+
     if debug:
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format='%(asctime)s [%(levelname)s] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[
-                logging.FileHandler("dji_drone.log"),
-                logging.StreamHandler(sys.stdout)
-            ]
-        )
-    else:
-        logging.basicConfig(
-            level=logging.WARNING,  # Only warnings and errors will be logged
-            format='%(asctime)s [%(levelname)s] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[
-                logging.FileHandler("dji_drone.log")
-            ]
-        )
+        log_handlers.append(logging.StreamHandler(sys.stdout))
+
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=log_handlers
+    )
 
 def iso_timestamp_now() -> str:
     """Return current UTC time as an ISO8601 string with 'Z' suffix."""
@@ -71,6 +74,10 @@ def write_atomic(file_path: str, data: list):
     """
     Writes data to a JSON file atomically to prevent data corruption.
     Writes to a temporary file first and then renames it.
+
+    Args:
+        file_path (str): Path to the target JSON file.
+        data (list): List of dictionaries containing drone and pilot data.
     """
     temp_file = f"{file_path}.tmp"
     try:
@@ -109,12 +116,11 @@ def parse_data_1(data):
         speed_N = struct.unpack('d', data[209:217])[0]
         speed_U = struct.unpack('d', data[217:225])[0]
         rssi = struct.unpack('h', data[225:227])[0]  # Corrected slicing to 2 bytes
-    except (UnicodeDecodeError, struct.error) as e:
-        print(f"Error parsing DJI DroneID data: {e}")
-        # Assign default or placeholder values in case of error
-        serial_number = "Unknown"
-        device_type = "Got a DJI drone with encryption"
+    except UnicodeDecodeError:
+        device_type = "Got a dji drone with encryption"
         device_type_8 = 255
+        # Initialize all other fields to default values to prevent NameError
+        serial_number = "Unknown"
         app_lat = app_lon = drone_lat = drone_lon = height = altitude = home_lat = home_lon = freq = speed_E = speed_N = speed_U = rssi = 0
 
     return {
@@ -136,75 +142,95 @@ def parse_data_1(data):
         'RSSI': rssi
     }
 
-def listen_to_antsdr(ip: str, port: int, drones: dict, pilots: dict, debug: bool):
+def tcp_client(debug: bool):
     """
     Connects to AntSDR, receives data, parses it, and updates the drones and pilots dictionaries.
+
+    Args:
+        debug (bool): If True, enables detailed logging.
     """
-    while True:
-        try:
-            logging.info(f"Connecting to AntSDR at {ip}:{port}...")
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.connect((ip, port))
-                logging.info(f"Successfully connected to AntSDR at {ip}:{port}")
-                # Removed socket timeout to prevent premature disconnections
+    server_ip = ANTSDR_IP
+    server_port = ANTSDR_PORT
 
-                buffer = b''
-                while True:
-                    try:
-                        data = sock.recv(1024)
-                        if not data:
-                            logging.warning("AntSDR connection closed by the server.")
-                            break
-                        buffer += data
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        client_socket.connect((server_ip, server_port))
+        logging.debug(f"Connect server success {server_ip}:{server_port}")
 
-                        # Log raw data if in debug mode
-                        if debug:
-                            logging.debug(f"Raw data received ({len(data)} bytes): {data.hex()}")
+        while True:
+            frame = client_socket.recv(1024)
+            if not frame:
+                logging.warning("Connection closed by AntSDR.")
+                break
+            package_type, data = parse_frame(frame)
+            if package_type == 0x01:
+                parsed_data = parse_data_1(data)
+                logging.debug("*****************")
+                logging.debug(f"Package Type: {package_type}")
+                for key, value in parsed_data.items():
+                    logging.debug(f"{key}: {value}")
+                logging.debug("*****************\n")
 
-                        # Process data in fixed-length frames
-                        while len(buffer) >= EXPECTED_FRAME_SIZE:
-                            frame = buffer[:EXPECTED_FRAME_SIZE]
-                            buffer = buffer[EXPECTED_FRAME_SIZE:]
-                            if frame:
-                                package_type, frame_data = parse_frame(frame)
-                                if package_type == 0x01 and frame_data:
-                                    parsed_data = parse_data_1(frame_data)
-                                    if parsed_data:
-                                        drones[parsed_data["serial_number"]] = parsed_data
-                                        logging.debug(f"Updated drone: {parsed_data['serial_number']}")
-                                        
-                                        # If pilot data is present and applicable, handle it here
-                                        # For example, associate pilot data based on certain conditions
-                                        # Currently, no pilot data handling is implemented
-                    except Exception as e_inner:
-                        logging.error(f"Error receiving data: {e_inner}")
-                        break  # Exit the inner loop to reconnect
-        except (ConnectionRefusedError, socket.error) as e:
-            logging.error(f"Connection error: {e}. Retrying in {RECONNECT_DELAY} seconds...")
-            time.sleep(RECONNECT_DELAY)
-        except Exception as e:
-            logging.exception(f"Unexpected error: {e}. Retrying in {RECONNECT_DELAY} seconds...")
-            time.sleep(RECONNECT_DELAY)
+                # Update drones and pilots dictionaries
+                serial = parsed_data["serial_number"]
+                drones[serial] = parsed_data
+
+                # Handle pilot data if available (app_lat and app_lon)
+                if is_valid_latlon(parsed_data["app_lat"], parsed_data["app_lon"]):
+                    pilot_id = f"pilot-{serial}"
+                    pilots[pilot_id] = {
+                        "id": pilot_id,
+                        "callsign": pilot_id,
+                        "time": iso_timestamp_now(),
+                        "lat": parsed_data["app_lat"],
+                        "lon": parsed_data["app_lon"],
+                        "speed": 0,          # Assuming no speed data for pilot
+                        "vspeed": 0,         # Assuming no vertical speed data for pilot
+                        "alt": parsed_data["altitude"],
+                        "height": parsed_data["height"],
+                        "description": "Pilot",
+                        "RSSI": parsed_data["RSSI"]
+                    }
+                    logging.debug(f"Pilot Data - {pilot_id}: {pilots[pilot_id]}")
+                else:
+                    # If no valid pilot data, remove existing pilot entry if any
+                    pilot_id = f"pilot-{serial}"
+                    if pilot_id in pilots:
+                        del pilots[pilot_id]
+                        logging.debug(f"Removed Pilot Data - {pilot_id}")
+
+    except Exception as e:
+        logging.debug(f"recv error: {e}")
+    finally:
+        client_socket.close()
+        logging.debug("disconnect")
 
 def parse_args():
-    """Parse command-line arguments."""
+    """
+    Parses command-line arguments.
+
+    Returns:
+        argparse.Namespace: Parsed arguments containing debug flag.
+    """
     parser = argparse.ArgumentParser(description="Connect to AntSDR, parse DJI DroneID data, and output to tar1090-compatible JSON.")
     parser.add_argument('-d', '--debug', action='store_true',
                         help='Enable debug mode for verbose output and raw data logging.')
-    parser.add_argument('-i', '--ip', type=str, default=DEFAULT_ANTSDR_IP,
-                        help=f'Specify the AntSDR IP address. Default is {DEFAULT_ANTSDR_IP}.')
-    parser.add_argument('-p', '--port', type=int, default=DEFAULT_ANTSDR_PORT,
-                        help=f'Specify the AntSDR port. Default is {DEFAULT_ANTSDR_PORT}.')
     return parser.parse_args()
 
 def handle_shutdown(signum, frame):
-    """Handle shutdown signals for graceful exit."""
-    print("Shutdown signal received. Exiting gracefully...")
+    """
+    Handles shutdown signals for graceful exit.
+
+    Args:
+        signum (int): Signal number.
+        frame: Current stack frame.
+    """
+    logging.info("Shutdown signal received. Exiting gracefully...")
     sys.exit(0)
 
 def main():
     """
-    Main function to initialize drone data collection and JSON writing.
+    Main function to initialize drone and pilot data collection and JSON writing.
     """
     args = parse_args()
     setup_logging(args.debug)
@@ -213,18 +239,14 @@ def main():
     signal.signal(signal.SIGINT, handle_shutdown)   # Handle Ctrl+C
     signal.signal(signal.SIGTERM, handle_shutdown)  # Handle termination signals
 
-    # Dictionaries to store active drones and pilots, keyed by their unique IDs
-    drones = {}
-    pilots = {}
-
-    # Start AntSDR listener in a separate thread
-    listener_thread = threading.Thread(
-        target=listen_to_antsdr,
-        args=(args.ip, args.port, drones, pilots, args.debug),
+    # Start the TCP client in a separate thread
+    client_thread = threading.Thread(
+        target=tcp_client,
+        args=(args.debug,),
         daemon=True
     )
-    listener_thread.start()
-    print("Started AntSDR listener thread.")
+    client_thread.start()
+    logging.info("Started TCP client thread.")
 
     # Main loop to periodically write drones and pilots data to JSON
     try:
@@ -234,11 +256,10 @@ def main():
 
             # Write the combined data to JSON atomically
             write_atomic(JSON_FILE_PATH, combined_data)
-            if args.debug:
-                print(f"Wrote {len(drones)} drones and {len(pilots)} pilots to JSON.")
+            logging.debug(f"Wrote {len(drones)} drones and {len(pilots)} pilots to JSON.")
             time.sleep(WRITE_INTERVAL)
     except KeyboardInterrupt:
-        print("Script interrupted by user. Exiting...")
+        logging.info("Script interrupted by user. Exiting...")
         sys.exit(0)
     except Exception as e:
         logging.exception(f"Unexpected error in main loop: {e}")
