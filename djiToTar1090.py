@@ -39,16 +39,25 @@ EXPECTED_FRAME_SIZE = 227                      # Expected bytes per frame
 
 def setup_logging(debug: bool):
     """Configure logging based on debug flag."""
-    log_level = logging.DEBUG if debug else logging.INFO
-    logging.basicConfig(
-        level=log_level,
-        format='%(asctime)s [%(levelname)s] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S',
-        handlers=[
-            logging.FileHandler("dji_drone.log"),
-            logging.StreamHandler(sys.stdout) if debug else logging.NullHandler()
-        ]
-    )
+    if debug:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format='%(asctime)s [%(levelname)s] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+            handlers=[
+                logging.FileHandler("dji_drone.log"),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+    else:
+        logging.basicConfig(
+            level=logging.WARNING,  # Only warnings and errors will be logged
+            format='%(asctime)s [%(levelname)s] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+            handlers=[
+                logging.FileHandler("dji_drone.log")
+            ]
+        )
 
 def iso_timestamp_now() -> str:
     """Return current UTC time as an ISO8601 string with 'Z' suffix."""
@@ -72,63 +81,19 @@ def write_atomic(file_path: str, data: list):
     except Exception as e:
         logging.error(f"Failed to write JSON data: {e}")
 
-def parse_frame(frame: bytes) -> tuple:
-    """
-    Parse the incoming frame from AntSDR.
-
-    Returns:
-        package_type (int): The type of the package.
-        data (bytes): The data payload of the package.
-    """
-    if len(frame) < 5:
-        logging.error(f"Frame too short: {len(frame)} bytes")
-        return None, None
-
+def parse_frame(frame):
     frame_header = frame[:2]
     package_type = frame[2]
     length_bytes = frame[3:5]
+    # struct.unpack parse uint16_t
     package_length = struct.unpack('H', length_bytes)[0]
-    logging.debug(f"Parsed Frame Header: {frame_header}")
-    logging.debug(f"Package Type: {package_type}")
-    logging.debug(f"Package Length: {package_length}")
-
-    # Ensure the frame has the expected length
-    expected_total_length = package_length
-    if len(frame) < expected_total_length:
-        logging.error(f"Incomplete frame received. Expected {expected_total_length} bytes, got {len(frame)} bytes.")
-        return None, None
-
-    data = frame[5:expected_total_length]
+    print(f"package_length: {package_length}")
+    data = frame[5:5 + package_length - 5]
     return package_type, data
 
-def parse_dji_data(data: bytes) -> tuple:
-    """
-    Parses binary DJI DroneID data from AntSDR.
-
-    Expected Data Structure:
-    - Serial Number: bytes 0-63 (64 bytes, UTF-8)
-    - Device Type: bytes 64-127 (64 bytes, UTF-8)
-    - Device Type 8: byte 128 (1 byte)
-    - App Lat: bytes 129-136 (8 bytes, double)
-    - App Lon: bytes 137-144 (8 bytes, double)
-    - Drone Lat: bytes 145-152 (8 bytes, double)
-    - Drone Lon: bytes 153-160 (8 bytes, double)
-    - Height: bytes 161-168 (8 bytes, double)
-    - Altitude: bytes 169-176 (8 bytes, double)
-    - Home Lat: bytes 177-184 (8 bytes, double)
-    - Home Lon: bytes 185-192 (8 bytes, double)
-    - Freq: bytes 193-200 (8 bytes, double)
-    - Speed E: bytes 201-208 (8 bytes, double)
-    - Speed N: bytes 209-216 (8 bytes, double)
-    - Speed U: bytes 217-224 (8 bytes, double)
-    - RSSI: bytes 225-226 (2 bytes, short)
-    """
+def parse_data_1(data):
     try:
-        if len(data) < EXPECTED_FRAME_SIZE:
-            logging.error(f"Received data length {len(data)} is less than expected {EXPECTED_FRAME_SIZE}.")
-            return {}, None
-
-        serial_number = data[0:64].decode('utf-8').rstrip('\x00')
+        serial_number = data[:64].decode('utf-8').rstrip('\x00')
         device_type = data[64:128].decode('utf-8').rstrip('\x00')
         device_type_8 = data[128]
         app_lat = struct.unpack('d', data[129:137])[0]
@@ -143,54 +108,33 @@ def parse_dji_data(data: bytes) -> tuple:
         speed_E = struct.unpack('d', data[201:209])[0]
         speed_N = struct.unpack('d', data[209:217])[0]
         speed_U = struct.unpack('d', data[217:225])[0]
-        rssi = struct.unpack('h', data[225:227])[0]  # Corrected to 2 bytes
+        rssi = struct.unpack('h', data[225:227])[0]  # Corrected slicing to 2 bytes
     except (UnicodeDecodeError, struct.error) as e:
-        logging.error(f"Error parsing DJI DroneID data: {e}")
+        print(f"Error parsing DJI DroneID data: {e}")
         # Assign default or placeholder values in case of error
         serial_number = "Unknown"
         device_type = "Got a DJI drone with encryption"
         device_type_8 = 255
         app_lat = app_lon = drone_lat = drone_lon = height = altitude = home_lat = home_lon = freq = speed_E = speed_N = speed_U = rssi = 0
 
-    # Validate drone latitude and longitude
-    if not is_valid_latlon(drone_lat, drone_lon):
-        logging.warning(f"Invalid drone latitude or longitude received: lat={drone_lat}, lon={drone_lon}")
-        return {}, None
-
-    # Construct drone information dictionary
-    drone_info = {
-        "id": serial_number,                               # Serial Number as ID
-        "callsign": serial_number,                         # Callsign as Serial Number
-        "time": iso_timestamp_now(),                       # Current UTC time
-        "lat": drone_lat,
-        "lon": drone_lon,
-        "speed": speed_E,                                  # Assuming speed_E as horizontal speed
-        "vspeed": speed_U,                                 # Vertical speed
-        "alt": altitude,                                   # Altitude
-        "height": height,                                  # Height above ground
-        "description": device_type if device_type else "DJI Drone",  # Device Type or default
-        "rssi": rssi                                       # RSSI value
+    return {
+        'serial_number': serial_number,
+        'device_type': device_type,
+        'device_type_8': device_type_8,
+        'app_lat': app_lat,
+        'app_lon': app_lon,
+        'drone_lat': drone_lat,
+        'drone_lon': drone_lon,
+        'height': height,
+        'altitude': altitude,
+        'home_lat': home_lat,
+        'home_lon': home_lon,
+        'freq': freq,
+        'speed_E': speed_E,
+        'speed_N': speed_N,
+        'speed_U': speed_U,
+        'RSSI': rssi
     }
-
-    # Construct pilot information dictionary if pilot data is valid
-    if is_valid_latlon(app_lat, app_lon):
-        pilot_id = f"pilot-{serial_number}"              # Unique ID for the pilot
-        pilot_info = {
-            "id": pilot_id,                                # Unique Pilot ID
-            "callsign": pilot_id,                          # Pilot Callsign
-            "time": iso_timestamp_now(),                   # Current UTC time
-            "lat": app_lat,
-            "lon": app_lon,
-            "speed": 0,                                     # Pilots might not have speed data
-            "vspeed": 0,                                    # Pilots might not have vspeed data
-            "alt": altitude,                                # Same altitude as drone
-            "height": height,                               # Same height as drone
-            "description": "Pilot",                         # Description for pilot
-            "rssi": rssi                                    # RSSI value (optional)
-        }
-        return drone_info, pilot_info
-    else:
-        return drone_info, None
 
 def listen_to_antsdr(ip: str, port: int, drones: dict, pilots: dict, debug: bool):
     """
@@ -224,20 +168,14 @@ def listen_to_antsdr(ip: str, port: int, drones: dict, pilots: dict, debug: bool
                             if frame:
                                 package_type, frame_data = parse_frame(frame)
                                 if package_type == 0x01 and frame_data:
-                                    parsed_data, pilot_info = parse_dji_data(frame_data)
+                                    parsed_data = parse_data_1(frame_data)
                                     if parsed_data:
-                                        drones[parsed_data["id"]] = parsed_data
-                                        logging.debug(f"Updated drone: {parsed_data['id']}")
-
-                                        if pilot_info:
-                                            pilots[pilot_info["id"]] = pilot_info
-                                            logging.debug(f"Updated pilot: {pilot_info['id']}")
-                                        else:
-                                            # Remove pilot entry if no pilot data
-                                            pilot_id = f"pilot-{parsed_data['id']}"
-                                            if pilot_id in pilots:
-                                                del pilots[pilot_id]
-                                                logging.debug(f"Removed pilot: {pilot_id}")
+                                        drones[parsed_data["serial_number"]] = parsed_data
+                                        logging.debug(f"Updated drone: {parsed_data['serial_number']}")
+                                        
+                                        # If pilot data is present and applicable, handle it here
+                                        # For example, associate pilot data based on certain conditions
+                                        # Currently, no pilot data handling is implemented
                     except Exception as e_inner:
                         logging.error(f"Error receiving data: {e_inner}")
                         break  # Exit the inner loop to reconnect
@@ -261,12 +199,12 @@ def parse_args():
 
 def handle_shutdown(signum, frame):
     """Handle shutdown signals for graceful exit."""
-    logging.info("Shutdown signal received. Exiting gracefully...")
+    print("Shutdown signal received. Exiting gracefully...")
     sys.exit(0)
 
 def main():
     """
-    Main function to initialize drone and pilot data collection and JSON writing.
+    Main function to initialize drone data collection and JSON writing.
     """
     args = parse_args()
     setup_logging(args.debug)
@@ -286,7 +224,7 @@ def main():
         daemon=True
     )
     listener_thread.start()
-    logging.info("Started AntSDR listener thread.")
+    print("Started AntSDR listener thread.")
 
     # Main loop to periodically write drones and pilots data to JSON
     try:
@@ -296,10 +234,11 @@ def main():
 
             # Write the combined data to JSON atomically
             write_atomic(JSON_FILE_PATH, combined_data)
-            logging.debug(f"Wrote {len(drones)} drones and {len(pilots)} pilots to JSON.")
+            if args.debug:
+                print(f"Wrote {len(drones)} drones and {len(pilots)} pilots to JSON.")
             time.sleep(WRITE_INTERVAL)
     except KeyboardInterrupt:
-        logging.info("Script interrupted by user. Exiting...")
+        print("Script interrupted by user. Exiting...")
         sys.exit(0)
     except Exception as e:
         logging.exception(f"Unexpected error in main loop: {e}")
