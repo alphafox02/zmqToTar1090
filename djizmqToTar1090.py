@@ -273,6 +273,11 @@ def main():
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
 
+    # Create the JSON file at startup if it doesn't exist
+    if not os.path.exists(JSON_FILE_PATH):
+        logging.info(f"{JSON_FILE_PATH} does not exist. Creating an initial empty JSON file.")
+        write_atomic(JSON_FILE_PATH, [])
+
     # Start the ZMQ subscriber thread
     sub_thread = threading.Thread(target=dji_subscriber_thread, args=(args.dji_url,), daemon=True)
     sub_thread.start()
