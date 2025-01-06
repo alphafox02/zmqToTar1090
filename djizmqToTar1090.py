@@ -68,7 +68,7 @@ def setup_logging(debug: bool):
 def iso_timestamp_now() -> str:
     """
     Returns the current UTC time as an ISO8601 string with 'Z' suffix.
-    Example: "2025-01-04T12:34:52.123Z"
+    Example: "2025-01-06T12:34:52.123Z"
     """
     return datetime.datetime.utcnow().isoformat(timespec='milliseconds') + 'Z'
 
@@ -298,12 +298,12 @@ def main():
                         "time": iso_timestamp_now(),
                         "lat": drone.get("drone_lat", 0.0),
                         "lon": drone.get("drone_lon", 0.0),
-                        "speed": 0.0,  # not provided
-                        "vspeed": 0.0,  # not provided
+                        "speed": 0.0,
+                        "vspeed": 0.0,
                         "alt": drone.get("altitude", 0.0),
                         "height": drone.get("height", 0.0),
                         "description": drone.get("device_type", "DJI Drone"),
-                        "rssi": 0.0  # not provided
+                        "rssi": 0.0
                     })
 
             # Lock pilots
@@ -312,6 +312,7 @@ def main():
                     lat = pilot_info["lat"]
                     lon = pilot_info["lon"]
                     if is_valid_latlon(lat, lon):
+                        # Prepend "Pilot:" to distinguish pilot's entry
                         pilot_description = f"Pilot: {pilot_info['description']}"
                         combined_data.append({
                             "id": pilot_id,
@@ -323,7 +324,7 @@ def main():
                             "vspeed": pilot_info["vspeed"],
                             "alt": pilot_info["alt"],
                             "height": pilot_info["height"],
-                            "description": pilot_info["description"],
+                            "description": pilot_description,
                             "rssi": pilot_info["RSSI"]
                         })
                     else:
