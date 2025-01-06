@@ -312,6 +312,7 @@ def main():
                     lat = pilot_info["lat"]
                     lon = pilot_info["lon"]
                     if is_valid_latlon(lat, lon):
+                        pilot_description = f"Pilot: {pilot_info['description']}"
                         combined_data.append({
                             "id": pilot_id,
                             "callsign": pilot_info["callsign"],
